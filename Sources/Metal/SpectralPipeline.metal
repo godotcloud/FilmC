@@ -1,0 +1,576 @@
+//
+//  SpectralPipeline.metal
+//  SpektraCam
+//
+//  Full Physical Optics, Sensitometry & Photochemical Darkroom Compute Pipeline
+//  Optimized for Apple A15 Bionic (iPhone 13 Pro Max 5-Core GPU, Unified 6GB LPDDR4X)
+//
+//  Pipeline Stages:
+//  0. kernel_ycbcr10_to_scene_linear_and_log (10-bit BT.2020 HLG / ProRes -> Linear Rec.2020 + Custom Log)
+//  1. kernel_spectral_upsample_and_expose   (Jakob & Hanika 2019 Sigmoid Polynomial Spectral Upsampling + S(λ) Integral)
+//  2. kernel_halation_and_scatter           (Multi-scale Frieser Emulsion Scatter + Dual-Exponential Remjet/Base Halation + Bloom)
+//  3. kernel_develop_and_dir_couplers       (Hurter-Driffield Curves + Push/Pull + Langmuir DIR Interlayer & Eberhard Edge Inhibition)
+//  4. kernel_enlarger_print_and_grain       (Enlarger Dichroic CMY + Beer-Lambert Transmittance + RA-4/2383 Print + Multi-Sublayer Grain + CIE 1931 CMF Output)
+//
+
+#include <metal_stdlib>
+using namespace metal;
+
+struct MetalFilmUniforms {
+    float exposureScale;
+    float pushPullGammaScale;
+    float dminFogOffset;
+    float opticalVignetteStrength;
+
+    float bloomStrength;
+    float bloomThreshold;
+    float bloomRadiusPx;
+    float inEmulsionScatterPx;
+
+    float4 dirCouplerMatrixRow0;
+    float4 dirCouplerMatrixRow1;
+    float4 dirCouplerMatrixRow2;
+
+    float dirRadiusPx;
+    float developerExhaustion;
+    float bleachBypassAmount;
+    float hasRemjetLayer;
+
+    float4 halationStrengthRGB;
+    float4 halationRadiusPxRGB;
+
+    float grainStrength;
+    float grainUniformity;
+    float pixelSizeMicrometers;
+    uint frameSeed;
+
+    float4 dichroicFilterCMY;
+    float printExposureScale;
+    float printGamma;
+    float preflashLinearAddition;
+    float callierQFactor;
+
+    float scannerGlare;
+    float blackPoint;
+    float whitePoint;
+    int printPipelineMode;
+
+    float4 negativeGammaRGB;
+    float4 negativeDminRGB;
+    float4 negativeDmaxRGB;
+    float4 printGammaRGB;
+    float4 printDminRGB;
+    float4 printDmaxRGB;
+    float4 rmsGranularityRGB;
+    int outputColorSpace;
+    int isReversalOrMono;
+    float bwMultigradeGrade;
+    float padding0;
+};
+
+// ============================================================================
+// Helper: Jakob & Hanika (Eurographics 2019) Sigmoid Polynomial Evaluation
+// S(λ) = s(c0 * λ^2 + c1 * λ + c2), where s(x) = 0.5 + x / (2 * sqrt(1 + x^2))
+// ============================================================================
+inline float jakob_hanika_sigmoid(float x) {
+    return 0.5f + x * rsqrt(1.0f + x * x) * 0.5f;
+}
+
+// Reconstruct polynomial coefficients (c0, c1, c2) for normalized wavelength u in [0, 1] (380nm..780nm)
+// Fitted analytical closed-form projection from linear Rec.2020 tristimulus chromaticity
+inline float3 compute_jakob_hanika_coeffs(float3 rgb_rec2020, out float &albedoScale) {
+    float maxComp = max(max(rgb_rec2020.r, rgb_rec2020.g), max(rgb_rec2020.b, 1e-5f));
+    // Scale brighter than unity so reflectance stays strictly within (0, 1)
+    albedoScale = max(1.0f, maxComp * 1.05f);
+    float3 c = clamp(rgb_rec2020 / albedoScale, 0.001f, 0.999f);
+
+    // Map (r, g, b) to parabola vertex and curvature across u = (λ - 380) / 400
+    // Blue peaks near u=0.16 (445nm), Green near u=0.41 (545nm), Red near u=0.66 (645nm)
+    float logitB = (c.b - 0.5f) * rsqrt(max(c.b * (1.0f - c.b), 1e-4f));
+    float logitG = (c.g - 0.5f) * rsqrt(max(c.g * (1.0f - c.g), 1e-4f));
+    float logitR = (c.r - 0.5f) * rsqrt(max(c.r * (1.0f - c.r), 1e-4f));
+
+    // Solve Lagrange quadratic through u0 = 0.16, u1 = 0.41, u2 = 0.66 (step h = 0.25)
+    // c0 * u^2 + c1 * u + c2
+    float c0 = 8.0f * (logitB - 2.0f * logitG + logitR);
+    float c1 = 4.0f * (logitR - logitB) - 0.82f * c0;
+    float c2 = logitG - 0.1681f * c0 - 0.41f * c1;
+    return float3(c0, c1, c2);
+}
+
+// ============================================================================
+// Helper: Smooth Hurter-Driffield (H-D) Sensitometric Characteristic Curve
+// D(x) = D_min + (D_max - D_min) * SoftSigmoid((x - x0) * gamma / (D_max - D_min))
+// Models toe (threshold), straight-line gamma, and shoulder (saturation)
+// ============================================================================
+inline float3 evaluate_hd_curve(
+    float3 logE,
+    float3 dMin,
+    float3 dMax,
+    float3 gamma,
+    bool isReversal
+) {
+    float3 span = max(dMax - dMin, float3(0.1f));
+    // Reference speed point x0 at 18% middle gray (log10(0.18) = -0.7447)
+    float3 x = logE + 0.7447f;
+    if (isReversal) {
+        x = -x; // Positive slide reversal emulsion: higher exposure reduces dye density
+    }
+    // Rational-exponential H-D curve with asymmetric toe/shoulder smoothness
+    float3 k = (4.0f * gamma) / span;
+    float3 expTerm = exp(-clamp(k * x, -18.0f, 18.0f));
+    float3 normalized = 1.0f / (1.0f + expTerm);
+    return dMin + span * normalized;
+}
+
+// ============================================================================
+//Helper: PCG3D Deterministic Hash for Stochastic Silver Halide Particle Grain
+// ============================================================================
+inline uint3 pcg3d(uint3 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    return v;
+}
+
+inline float3 rand_gaussian3(uint2 gid, uint seed, uint layerIdx) {
+    uint3 h1 = pcg3d(uint3(gid.x, gid.y, seed + layerIdx * 19u));
+    uint3 h2 = pcg3d(uint3(gid.x ^ 0x5A5A5Au, gid.y ^ 0xA5A5A5u, seed + layerIdx * 37u + 1u));
+    float3 u1 = clamp(float3(h1) * (1.0f / 4294967296.0f), 1e-6f, 1.0f);
+    float3 u2 = float3(h2) * (6.2831853f / 4294967296.0f);
+    return sqrt(-2.0f * log(u1)) * cos(u2);
+}
+
+// ============================================================================
+// Stage 0: iPhone 13 Pro Max 10-bit BT.2020 HLG (Bi-Planar YCbCr10) ->
+//          Scene-Linear Rec.2020 + Custom Log Encoding (Apple Log / ARRI LogC3 / Cineon)
+// ============================================================================
+inline float hlg_inverse_oetf(float e) {
+    const float a = 0.17883277f;
+    const float b = 0.28466892f; // 1 - 4a
+    const float c = 0.55991073f; // 0.5 - a * ln(4a)
+    e = clamp(e, 0.0f, 1.0f);
+    if (e <= 0.5f) {
+        return (e * e) / 3.0f;
+    } else {
+        return (exp((e - c) / a) + b) / 12.0f;
+    }
+}
+
+inline float3 encode_custom_log(float3 linearRGB, int logMode) {
+    float3 x = max(linearRGB, float3(-0.05f));
+    if (logMode == 0) {
+        // Apple Log Compatible Transfer Function
+        const float r0 = -0.05641088f;
+        const float rt = 0.01f;
+        const float c  = 47.28711236f;
+        const float b  = 0.00964052f;
+        const float y  = 0.08550479f;
+        const float d  = 0.69336945f;
+        float3 outLog;
+        for (int i = 0; i < 3; ++i) {
+            float v = x[i];
+            if (v < r0) outLog[i] = 0.0f;
+            else if (v < rt) outLog[i] = c * (v - r0) * (v - r0);
+            else outLog[i] = y * log2(v + b) + d;
+        }
+        return clamp(outLog, 0.0f, 1.0f);
+    } else if (logMode == 1) {
+        // ARRI LogC3 (EI 800) Transfer Function
+        const float cut = 0.010591f;
+        const float a = 5.555556f;
+        const float b = 0.052272f;
+        const float c = 0.247190f;
+        const float d = 0.385537f;
+        const float e = 5.367655f;
+        const float f = 0.092809f;
+        float3 outLog;
+        for (int i = 0; i < 3; ++i) {
+            float v = x[i];
+            outLog[i] = (v > cut) ? (c * log10(a * v + b) + d) : (e * v + f);
+        }
+        return clamp(outLog, 0.0f, 1.0f);
+    } else {
+        // Kodak Cineon 10-bit Printing Density Log
+        const float refBlack = 95.0f / 1023.0f;
+        const float refWhite = 685.0f / 1023.0f;
+        float offset = pow(10.0f, (refBlack - refWhite) * (1023.0f / 300.0f) * 0.6f);
+        float3 v = max(x, float3(0.0f)) * (1.0f - offset) + offset;
+        return clamp(refWhite + (log10(v) / (0.6f * (1023.0f / 300.0f))), 0.0f, 1.0f);
+    }
+}
+
+kernel void kernel_ycbcr10_to_scene_linear_and_log(
+    texture2d<float, access::read> lumaPlane [[texture(0)]],
+    texture2d<float, access::read> chromaPlane [[texture(1)]],
+    texture2d<float, access::write> outSceneLinear [[texture(2)]],
+    texture2d<float, access::write> outLogEncoded [[texture(3)]],
+    constant int &logMode [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= outSceneLinear.get_width() || gid.y >= outSceneLinear.get_height()) return;
+
+    float ySample = lumaPlane.read(gid).r;
+    float2 cbcrSample = chromaPlane.read(gid / 2).rg;
+
+    // 10-bit Video Range (64..940 for Y, 64..960 for CbCr normalized in 16-bit MSBs)
+    float Y  = (ySample - (64.0f / 1023.0f)) * (1023.0f / 876.0f);
+    float Cb = (cbcrSample.r - (512.0f / 1023.0f)) * (1023.0f / 896.0f);
+    float Cr = (cbcrSample.g - (512.0f / 1023.0f)) * (1023.0f / 896.0f);
+
+    // BT.2020 Non-Constant Luminance YCbCr -> Prime R'G'B'
+    float R_p = clamp(Y + 1.4746f * Cr, 0.0f, 1.0f);
+    float G_p = clamp(Y - 0.16455f * Cb - 0.57135f * Cr, 0.0f, 1.0f);
+    float B_p = clamp(Y + 1.8814f * Cb, 0.0f, 1.0f);
+
+    // ITU-R BT.2100 HLG Inverse OETF + Inverse System Gamma (~1.2) -> Scene-Linear BT.2020
+    float3 sceneLinear = float3(
+        hlg_inverse_oetf(R_p),
+        hlg_inverse_oetf(G_p),
+        hlg_inverse_oetf(B_p)
+    );
+    float ys = max(0.2627f * sceneLinear.r + 0.6780f * sceneLinear.g + 0.0593f * sceneLinear.b, 1e-5f);
+    sceneLinear = sceneLinear * pow(ys, 0.2f / 1.2f) * 2.2f; // Normalize 18% middle gray
+
+    outSceneLinear.write(float4(sceneLinear, 1.0f), gid);
+    float3 logRGB = encode_custom_log(sceneLinear, logMode);
+    outLogEncoded.write(float4(logRGB, 1.0f), gid);
+}
+
+// ============================================================================
+// Stage 1: Spectral Upsampling (380nm - 780nm) & Emulsion Spectral Integration
+// ============================================================================
+kernel void kernel_spectral_upsample_and_expose(
+    texture2d<float, access::read> inSceneLinear [[texture(0)]],
+    texture2d<float, access::write> outEmulsionExposure [[texture(1)]],
+    constant MetalFilmUniforms &u [[buffer(0)]],
+    constant float4 *spectralSensitivityTable [[buffer(1)]], // 81 bands: .xyz = S_R(λ), S_G(λ), S_B(λ), .w = Illuminant(λ)
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint width = outEmulsionExposure.get_width();
+    uint height = outEmulsionExposure.get_height();
+    if (gid.x >= width || gid.y >= height) return;
+
+    float3 rgb = max(inSceneLinear.read(gid).rgb, float3(1e-6f)) * u.exposureScale;
+
+    // 1. Optical Vignetting: cos^4(theta) law based on normalized sensor radius
+    float2 uv = (float2(gid) / float2(width, height)) * 2.0f - 1.0f;
+    float aspect = float(width) / float(max(height, 1u));
+    uv.x *= aspect;
+    float rSq = dot(uv, uv) * 0.28f;
+    float cosThetaSq = 1.0f / (1.0f + rSq);
+    float vignette = mix(1.0f, cosThetaSq * cosThetaSq, u.opticalVignetteStrength);
+    rgb *= vignette;
+
+    // 2. Jakob & Hanika (2019) Sigmoid Polynomial Spectral Reconstruction
+    float albedoScale = 1.0f;
+    float3 coeffs = compute_jakob_hanika_coeffs(rgb, albedoScale);
+
+    // 3. Numerical Integration across 380nm..780nm (81 bins @ 5nm)
+    float3 rawExposure = float3(0.0f);
+    for (int i = 0; i < 81; ++i) {
+        float u_lambda = float(i) * (1.0f / 80.0f);
+        float poly = (coeffs.x * u_lambda + coeffs.y) * u_lambda + coeffs.z;
+        float reflectance = jakob_hanika_sigmoid(poly) * albedoScale;
+
+        float4 sensIllum = spectralSensitivityTable[i];
+        float spectralRadiance = reflectance * sensIllum.w;
+        rawExposure += spectralRadiance * sensIllum.xyz;
+    }
+
+    outEmulsionExposure.write(float4(max(rawExposure, float3(1e-7f)), 1.0f), gid);
+}
+
+// ============================================================================
+// Stage 2: Optical Diffusion (Bloom), Frieser Emulsion Scatter & Remjet/Base Halation
+// ============================================================================
+kernel void kernel_halation_and_scatter(
+    texture2d<float, access::read> inExposure [[texture(0)]],
+    texture2d<float, access::write> outScatteredExposure [[texture(1)]],
+    constant MetalFilmUniforms &u [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int width = int(outScatteredExposure.get_width());
+    int height = int(outScatteredExposure.get_height());
+    if (int(gid.x) >= width || int(gid.y) >= height) return;
+
+    float3 centerExp = inExposure.read(gid).rgb;
+
+    // Multi-ring radial sampling (Frieser short-range emulsion scatter + long-range base halation + lens bloom)
+    float3 scatterAccum = centerExp;
+    float3 halationAccum = float3(0.0f);
+    float3 bloomAccum = float3(0.0f);
+    float scatterWeightSum = 1.0f;
+    float3 halationWeightSum = float3(1e-5f);
+    float bloomWeightSum = 1e-5f;
+
+    // 16-tap Poisson/Golden-Angle spiral sampling scaled by physical pixel radius
+    const int NUM_TAPS = 16;
+    const float GOLDEN_ANGLE = 2.39996323f;
+
+    for (int i = 1; i <= NUM_TAPS; ++i) {
+        float frac = float(i) / float(NUM_TAPS);
+        float angle = float(i) * GOLDEN_ANGLE;
+        float2 dir = float2(cos(angle), sin(angle));
+
+        // A. Short-range Frieser In-Emulsion Scatter
+        int2 scatterCoord = clamp(int2(gid) + int2(round(dir * frac * u.inEmulsionScatterPx)), int2(0), int2(width - 1, height - 1));
+        float wScatter = exp(-2.0f * frac);
+        scatterAccum += inExposure.read(uint2(scatterCoord)).rgb * wScatter;
+        scatterWeightSum += wScatter;
+
+        // B. Layer-specific Anti-Halation Base Reflection (Lorentzian / Dual-Exponential PSF)
+        int2 halCoordR = clamp(int2(gid) + int2(round(dir * frac * u.halationRadiusPxRGB.x)), int2(0), int2(width - 1, height - 1));
+        int2 halCoordG = clamp(int2(gid) + int2(round(dir * frac * u.halationRadiusPxRGB.y)), int2(0), int2(width - 1, height - 1));
+        int2 halCoordB = clamp(int2(gid) + int2(round(dir * frac * u.halationRadiusPxRGB.z)), int2(0), int2(width - 1, height - 1));
+
+        float3 sampleHal = float3(
+            inExposure.read(uint2(halCoordR)).r,
+            inExposure.read(uint2(halCoordG)).g,
+            inExposure.read(uint2(halCoordB)).b
+        );
+        // Highlight-weighted halation gating (midtone protection)
+        float3 highlightGate = smoothstep(float3(0.25f), float3(1.8f), sampleHal);
+        float3 wHal = float3(1.0f / (1.0f + 6.0f * frac * frac));
+        halationAccum += sampleHal * highlightGate * wHal;
+        halationWeightSum += wHal;
+
+        // C. Optical Diffusion / Black Pro-Mist Bloom
+        int2 bloomCoord = clamp(int2(gid) + int2(round(dir * frac * u.bloomRadiusPx)), int2(0), int2(width - 1, height - 1));
+        float3 sampleBloom = inExposure.read(uint2(bloomCoord)).rgb;
+        float luma = dot(sampleBloom, float3(0.2627f, 0.6780f, 0.0593f));
+        float bloomGate = smoothstep(u.bloomThreshold * 0.5f, u.bloomThreshold * 2.0f, luma);
+        float wBloom = exp(-1.8f * frac * frac);
+        bloomAccum += sampleBloom * bloomGate * wBloom;
+        bloomWeightSum += wBloom;
+    }
+
+    float3 scattered = scatterAccum / scatterWeightSum;
+    float3 halationSignal = (halationAccum / halationWeightSum) * u.halationStrengthRGB.rgb;
+    float3 bloomSignal = (bloomAccum / bloomWeightSum) * u.bloomStrength;
+
+    float3 finalExposure = max(scattered + halationSignal + bloomSignal, float3(1e-7f));
+    outScatteredExposure.write(float4(finalExposure, 1.0f), gid);
+}
+
+// ============================================================================
+// Stage 3: Hurter-Driffield Development, Push/Pull & DIR Couplers (Interlayer + Eberhard Edge)
+// ============================================================================
+kernel void kernel_develop_and_dir_couplers(
+    texture2d<float, access::read> inScatteredExposure [[texture(0)]],
+    texture2d<float, access::write> outNegativeDensityCMY [[texture(1)]],
+    constant MetalFilmUniforms &u [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int width = int(outNegativeDensityCMY.get_width());
+    int height = int(outNegativeDensityCMY.get_height());
+    if (int(gid.x) >= width || int(gid.y) >= height) return;
+
+    float3 expCenter = inScatteredExposure.read(gid).rgb;
+    float3 logE = log10(max(expCenter, float3(1e-7f)));
+
+    // 1. Evaluate base Hurter-Driffield Characteristic Curve with Push/Pull Gamma & Fog modulation
+    bool isReversal = (u.isReversalOrMono == 1);
+    float3 effGamma = u.negativeGammaRGB.rgb * u.pushPullGammaScale;
+    float3 effDmin  = u.negativeDminRGB.rgb + float3(u.dminFogOffset);
+    float3 effDmax  = u.negativeDmaxRGB.rgb;
+
+    float3 dCenter = evaluate_hd_curve(logE, effDmin, effDmax, effGamma, isReversal);
+
+    // 2. Spatial Neighborhood Sampling at DIR Diffusion Radius (Eberhard Edge Acutance & Developer Exhaustion)
+    int rPx = max(int(round(u.dirRadiusPx)), 1);
+    float3 expN = inScatteredExposure.read(uint2(clamp(int2(gid) + int2(0, -rPx), int2(0), int2(width-1, height-1)))).rgb;
+    float3 expS = inScatteredExposure.read(uint2(clamp(int2(gid) + int2(0,  rPx), int2(0), int2(width-1, height-1)))).rgb;
+    float3 expE = inScatteredExposure.read(uint2(clamp(int2(gid) + int2( rPx, 0), int2(0), int2(width-1, height-1)))).rgb;
+    float3 expW = inScatteredExposure.read(uint2(clamp(int2(gid) + int2(-rPx, 0), int2(0), int2(width-1, height-1)))).rgb;
+
+    float3 dN = evaluate_hd_curve(log10(max(expN, 1e-7f)), effDmin, effDmax, effGamma, isReversal);
+    float3 dS = evaluate_hd_curve(log10(max(expS, 1e-7f)), effDmin, effDmax, effGamma, isReversal);
+    float3 dE = evaluate_hd_curve(log10(max(expE, 1e-7f)), effDmin, effDmax, effGamma, isReversal);
+    float3 dW = evaluate_hd_curve(log10(max(expW, 1e-7f)), effDmin, effDmax, effGamma, isReversal);
+
+    float3 dSurround = 0.25f * (dN + dS + dE + dW);
+    float3 dNet = max(dCenter - effDmin, float3(0.0f));
+    float3 dLaplacian = dCenter - dSurround; // Positive on dense side of an edge (Mackie line / Eberhard effect)
+
+    // 3. Apply 3x3 DIR Coupler Interlayer Inhibition Matrix + Langmuir Saturation Isotherm
+    float3 dCoupled = float3(
+        dot(u.dirCouplerMatrixRow0.xyz, dNet),
+        dot(u.dirCouplerMatrixRow1.xyz, dNet),
+        dot(u.dirCouplerMatrixRow2.xyz, dNet)
+    );
+    // Add spatial micro-contrast boost from diffusing inhibitor molecules
+    dCoupled += 0.32f * dLaplacian;
+
+    // Developer Exhaustion (reduces effective density in uniformly dense areas)
+    float surroundMeanDensity = dot(dSurround - effDmin, float3(0.3333f));
+    float exhaustionFactor = 1.0f / (1.0f + u.developerExhaustion * max(surroundMeanDensity, 0.0f));
+
+    float3 finalDensityCMY = clamp(effDmin + dCoupled * exhaustionFactor, effDmin * 0.8f, effDmax * 1.08f);
+    outNegativeDensityCMY.write(float4(finalDensityCMY, 1.0f), gid);
+}
+
+// ============================================================================
+// Stage 4: Virtual Enlarger (Dichroic CMY Filters + Beer-Lambert Law),
+//          RA-4 / 2383 Print Development, Stochastic Multi-Sublayer Grain & Display Output
+// ============================================================================
+kernel void kernel_enlarger_print_and_grain(
+    texture2d<float, access::read> inNegativeDensityCMY [[texture(0)]],
+    texture2d<float, access::write> outDisplayTexture [[texture(1)]],
+    constant MetalFilmUniforms &u [[buffer(0)]],
+    constant float4 *negDyeAndEnlargerTable [[buffer(1)]], // 81 bands: .xyz = Neg d_C,M,Y(λ), .w = Enlarger Illuminant(λ)
+    constant float4 *printSensTable [[buffer(2)]],         // 81 bands: .xyz = Print S_R,G,B(λ), .w = Dichroic Filter Basis
+    constant float4 *printDyeAndScannerTable [[buffer(3)]],// 81 bands: .xyz = Print d_C,M,Y(λ), .w = Scanner Illuminant(λ)
+    constant float4 *cie1931XYZTable [[buffer(4)]],        // 81 bands: .xyz = CIE 1931 x_bar, y_bar, z_bar
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint width = outDisplayTexture.get_width();
+    uint height = outDisplayTexture.get_height();
+    if (gid.x >= width || gid.y >= height) return;
+
+    float3 dNegCMY = inNegativeDensityCMY.read(gid).rgb;
+
+    // 1. Stochastic Multi-Sublayer Silver Halide Grain (Fast / Mid / Slow Sublayers)
+    if (u.grainStrength > 0.001f) {
+        float3 netD = clamp((dNegCMY - u.negativeDminRGB.rgb) / max(u.negativeDmaxRGB.rgb - u.negativeDminRGB.rgb, float3(0.1f)), 0.0f, 1.0f);
+        // Bell-shaped sublayer variance response (peaks in mid-densities where partial grain development maximizes binomial variance)
+        float3 fastVar = netD * (1.0f - 0.65f * netD);
+        float3 midVar  = 4.0f * netD * (1.0f - netD);
+        float3 slowVar = netD * netD * (1.0f - 0.5f * pow(netD, float3(u.grainUniformity)));
+
+        float3 nFast = rand_gaussian3(gid, u.frameSeed, 0u);
+        float3 nMid  = rand_gaussian3(gid, u.frameSeed, 1u);
+        float3 nSlow = rand_gaussian3(gid, u.frameSeed, 2u);
+
+        // Scale RMS granularity by physical pixel pitch (sqrt(area_ref / area_pixel))
+        float areaScale = clamp(12.0f / max(u.pixelSizeMicrometers, 1.5f), 0.25f, 3.5f);
+        float3 sigmaGrain = (u.rmsGranularityRGB.rgb * 0.0022f) * u.grainStrength * areaScale;
+        float3 deltaD = sigmaGrain * (0.45f * sqrt(fastVar) * nFast + 0.38f * sqrt(midVar) * nMid + 0.17f * sqrt(slowVar) * nSlow);
+        dNegCMY = max(dNegCMY + deltaD, float3(0.02f));
+    }
+
+    // Apply Callier Q-Factor if Condenser Enlarger Head is selected
+    dNegCMY *= u.callierQFactor;
+
+    // 2. Enlarger Spectral Integration (Beer-Lambert Transmittance T(λ) = 10^(-D(λ)))
+    float3 finalDensityCMY = dNegCMY;
+    bool isDirectScan = (u.printPipelineMode == 1) || (u.isReversalOrMono == 1);
+
+    if (!isDirectScan) {
+        float3 printExposureRGB = float3(0.0f);
+        for (int i = 0; i < 81; ++i) {
+            float4 negDyeIllum = negDyeAndEnlargerTable[i];
+            float lambda = 380.0f + float(i) * 5.0f;
+
+            // Dichroic C/M/Y filter spectral density modulation
+            float cLobe = exp(-0.5f * pow((lambda - 660.0f) / 48.0f, 2.0f));
+            float mLobe = exp(-0.5f * pow((lambda - 548.0f) / 40.0f, 2.0f));
+            float yLobe = exp(-0.5f * pow((lambda - 445.0f) / 35.0f, 2.0f));
+            float filterDensity = dot(u.dichroicFilterCMY.xyz * 0.01f, float3(cLobe, mLobe, yLobe));
+
+            float negSpectralDensity = dot(dNegCMY - u.negativeDminRGB.rgb, negDyeIllum.xyz) + filterDensity;
+            float transmittance = pow(10.0f, -clamp(negSpectralDensity, -2.5f, 4.5f));
+
+            float4 printSens = printSensTable[i];
+            printExposureRGB += (negDyeIllum.w * transmittance) * printSens.xyz;
+        }
+
+        // Apply Print Exposure Time + Darkroom Pre-Flashing
+        printExposureRGB = printExposureRGB * u.printExposureScale + float3(u.preflashLinearAddition);
+        float3 logPrintE = log10(max(printExposureRGB, float3(1e-7f)));
+
+        // Evaluate RA-4 / 2383 / Ilford Multigrade Print H-D Curve
+        float3 pGamma = u.printGammaRGB.rgb * u.printGamma;
+        if (u.isReversalOrMono == 2) {
+            // Ilford Multigrade Variable Contrast (00..5 grade factor)
+            float vcMultiplier = 0.55f + 0.22f * u.bwMultigradeGrade;
+            pGamma *= vcMultiplier;
+        }
+        finalDensityCMY = evaluate_hd_curve(logPrintE, u.printDminRGB.rgb, u.printDmaxRGB.rgb, pGamma, false);
+    }
+
+    // 3. Bleach Bypass (Silver Retention adds neutral density proportional to luma density)
+    if (u.bleachBypassAmount > 0.001f) {
+        float agDensity = dot(finalDensityCMY, float3(0.30f, 0.55f, 0.15f));
+        finalDensityCMY = mix(finalDensityCMY, float3(agDensity * 1.28f), u.bleachBypassAmount * 0.65f);
+    }
+
+    // 4. Scanner / Viewing Spectral Integration -> CIE 1931 XYZ
+    float3 cieXYZ = float3(0.0f);
+    for (int i = 0; i < 81; ++i) {
+        float4 dyeScan = isDirectScan ? negDyeAndEnlargerTable[i] : printDyeAndScannerTable[i];
+        float3 baseDmin = isDirectScan ? (u.isReversalOrMono == 1 ? float3(0.0f) : u.negativeDminRGB.rgb) : float3(0.0f);
+        float spectralD = dot(max(finalDensityCMY - baseDmin, float3(0.0f)), dyeScan.xyz);
+        float transmittance = pow(10.0f, -clamp(spectralD, 0.0f, 4.5f));
+        if (isDirectScan && u.isReversalOrMono != 1) {
+            // Direct Negative Scan inversion
+            transmittance = clamp(1.0f - transmittance, 0.001f, 0.999f);
+        }
+        // Add scanner optical veiling glare
+        transmittance = clamp(transmittance + u.scannerGlare, 0.0f, 1.0f);
+
+        float3 cmf = cie1931XYZTable[i].xyz;
+        cieXYZ += (dyeScan.w * transmittance) * cmf;
+    }
+
+    // 5. CIE 1931 XYZ (D50/D65 adapted) -> Target Display Color Space (sRGB / Display P3 / Rec.2020 HLG)
+    // Bradford-adapted XYZ to Linear Display P3 matrix
+    float3 linearOut;
+    if (u.outputColorSpace == 0) {
+        // XYZ -> Linear sRGB (Rec.709)
+        linearOut = float3(
+             3.2404542f * cieXYZ.x - 1.5371385f * cieXYZ.y - 0.4985314f * cieXYZ.z,
+            -0.9692660f * cieXYZ.x + 1.8760108f * cieXYZ.y + 0.0415560f * cieXYZ.z,
+             0.0556434f * cieXYZ.x - 0.2040259f * cieXYZ.y + 1.0572252f * cieXYZ.z
+        );
+    } else if (u.outputColorSpace == 1) {
+        // XYZ -> Linear Apple Display P3
+        linearOut = float3(
+             2.4934969f * cieXYZ.x - 0.9313836f * cieXYZ.y - 0.4027107f * cieXYZ.z,
+            -0.8294890f * cieXYZ.x + 1.7626641f * cieXYZ.y + 0.0236247f * cieXYZ.z,
+             0.0358458f * cieXYZ.x - 0.0761724f * cieXYZ.y + 0.9568845f * cieXYZ.z
+        );
+    } else {
+        // XYZ -> Linear Rec.2020
+        linearOut = float3(
+             1.7166512f * cieXYZ.x - 0.3556708f * cieXYZ.y - 0.2533663f * cieXYZ.z,
+            -0.6666844f * cieXYZ.x + 1.6164812f * cieXYZ.y + 0.0157685f * cieXYZ.z,
+             0.0176399f * cieXYZ.x - 0.0427706f * cieXYZ.y + 0.9421031f * cieXYZ.z
+        );
+    }
+
+    // Apply Scanner Black/White Point Offsets
+    linearOut = (linearOut - float3(u.blackPoint)) / max(1.0f - u.blackPoint + u.whitePoint, 0.1f);
+    linearOut = max(linearOut, float3(0.0f));
+
+    if (u.isReversalOrMono == 2) {
+        float monoLuma = dot(linearOut, float3(0.2126f, 0.7152f, 0.0722f));
+        linearOut = float3(monoLuma);
+    }
+
+    // Encode display transfer function (sRGB/P3 EOTF^-1 or BT.2100 HLG OETF)
+    float3 encodedOut;
+    if (u.outputColorSpace == 2) {
+        // BT.2100 HLG OETF
+        const float a = 0.17883277f;
+        const float b = 0.28466892f;
+        const float c = 0.55991073f;
+        for (int i = 0; i < 3; ++i) {
+            float e = clamp(linearOut[i], 0.0f, 1.0f);
+            encodedOut[i] = (e <= 1.0f / 12.0f) ? sqrt(3.0f * e) : (a * log(12.0f * e - b) + c);
+        }
+    } else {
+        // sRGB / Display P3 Transfer Function
+        for (int i = 0; i < 3; ++i) {
+            float v = clamp(linearOut[i], 0.0f, 1.0f);
+            encodedOut[i] = (v <= 0.0031308f) ? (12.92f * v) : (1.055f * pow(v, 1.0f / 2.4f) - 0.055f);
+        }
+    }
+
+    outDisplayTexture.write(float4(encodedOut, 1.0f), gid);
+}

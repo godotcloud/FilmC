@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>$(DEVELOPMENT_LANGUAGE)</string>
+    <key>CFBundleDisplayName</key>
+    <string>SpektraCam</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleIdentifier</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>$(PRODUCT_NAME)</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <key>CADisableMinimumFrameDurationOnPhone</key>
+    <true/>
+    <key>NSCameraUsageDescription</key>
+    <string>SpektraCam requires direct access to the iPhone 13 Pro Max triple-camera system for 12-bit Apple ProRAW and 10-bit BT.2020 HLG Log spectral film capture.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>SpektraCam requires microphone access to record synchronized PCM audio during 10-bit Log and baked physical film video capture.</string>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>SpektraCam requires photo library access to load and inspect captured DNG negatives and spectral prints.</string>
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>SpektraCam requires permission to save 16-bit spectral darkroom renders, 12-bit DNG files, and 10-bit ProRes/HEVC Log videos to your library.</string>
+    <key>UILaunchScreen</key>
+    <dict/>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+</dict>
+</plist>
