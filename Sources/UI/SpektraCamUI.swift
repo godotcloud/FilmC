@@ -3,6 +3,8 @@
 //  SpektraCam
 //
 //  Native Darkroom UI & 120Hz ProMotion MetalKit Viewfinder for iPhone 13 Pro Max (6.7" 428x926 pt)
+//  Uses `.bgra8Unorm` (with Display P3 wide gamut) which natively supports `MTLTextureUsage.shaderWrite`
+//  across all iOS 16+ CAMetalLayer configurations without triggering drawable validation crashes.
 //
 
 import SwiftUI
@@ -21,13 +23,14 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
     public func makeUIView(context: Context) -> MTKView {
         let mtkView = MTKView()
         mtkView.device = cameraService.metalRenderer?.device
-        mtkView.framebufferOnly = false
-        mtkView.colorPixelFormat = .bgra10_xr // Wide-Gamut 10-bit Extended Range for Super Retina XDR
-        mtkView.preferredFramesPerSecond = 120 // ProMotion 120Hz UI responsiveness
+        mtkView.framebufferOnly = false // Required for Compute Shader write access to drawable.texture
+        mtkView.colorPixelFormat = .bgra8Unorm // Guaranteed shaderWrite support on all iOS CAMetalLayers
+        mtkView.preferredFramesPerSecond = 60
         mtkView.enableSetNeedsDisplay = false
         mtkView.isPaused = false
+        mtkView.autoResizeDrawable = true
+        mtkView.clearColor = MTLClearColor(red: 0.05, green: 0.05, blue: 0.05, alpha: 1.0)
         mtkView.delegate = context.coordinator
-        context.coordinator.bind(to: mtkView)
         return mtkView
     }
 
@@ -40,35 +43,37 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
         let cameraService: CameraCaptureService
         var currentParams = FilmSimulationParameters()
         var logCurve: LogEncodingTransferFunction = .appleLogCompatible
-        private var latestPixelBuffer: CVPixelBuffer?
 
         init(cameraService: CameraCaptureService) {
             self.cameraService = cameraService
             super.init()
         }
 
-        @MainActor
-        func bind(to view: MTKView) {
-            cameraService.onFrameReadyForMTKView = { [weak self] pb in
-                self?.latestPixelBuffer = pb
-            }
-        }
-
         public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
         public func draw(in view: MTKView) {
-            guard let pb = latestPixelBuffer,
-                  let drawable = view.currentDrawable,
+            guard let drawable = view.currentDrawable else { return }
+            guard let pb = cameraService.latestPixelBuffer,
                   let renderer = cameraService.metalRenderer else {
+                // If camera hasn't delivered the first frame yet, present a clean darkroom clear pass
+                if let cmdBuf = cameraService.metalRenderer?.commandQueue.makeCommandBuffer(),
+                   let rpd = view.currentRenderPassDescriptor,
+                   let enc = cmdBuf.makeRenderCommandEncoder(descriptor: rpd) {
+                    enc.endEncoding()
+                    cmdBuf.present(drawable)
+                    cmdBuf.commit()
+                }
                 return
             }
-            _ = renderer.processVideoSampleBuffer(
+
+            if renderer.processVideoSampleBuffer(
                 pixelBuffer: pb,
                 params: currentParams,
                 logCurve: logCurve,
                 outputDrawableTexture: drawable.texture
-            )
-            drawable.present()
+            ) != nil {
+                drawable.present()
+            }
         }
     }
 }
@@ -100,20 +105,19 @@ public struct SpektraCamMainView: View {
             Color.black.ignoresSafeArea()
 
             VStack(spacing: 6) {
-                // 1. Top Telemetry Bar (Stock Info, Format Gate, Log Mode, Waveform Mini-Scope)
+                // 1. Top Telemetry Bar
                 topTelemetryHeader
 
-                // 2. Real-Time Metal Spectral Viewfinder (3:2 or 16:9 Gate Aspect)
+                // 2. Real-Time Metal Spectral Viewfinder
                 ZStack(alignment: .bottomLeading) {
                     MetalFilmViewfinder(cameraService: cameraService, params: $params)
-                        .aspectRatio(cameraService.isCaptureModeVideo ? 16.0/9.0 : 3.0/2.0, contentMode: .fit)
+                        .aspectRatio(cameraService.isCaptureModeVideo ? 16.0/9.0 : 3.0/4.0, contentMode: .fit)
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                         .overlay(
                             RoundedRectangle(cornerRadius: 10)
                                 .stroke(Color.orange.opacity(0.45), lineWidth: 1)
                         )
 
-                    // Triple Lens Selector Overlay (13mm / 26mm / 77mm)
                     lensSelectorPill
                         .padding(10)
                 }
@@ -142,7 +146,6 @@ public struct SpektraCamMainView: View {
         }
     }
 
-    // MARK: - Top Telemetry Header
     private var topTelemetryHeader: some View {
         let neg = FilmStockDatabase.cameraStock(withID: params.negativeStockID)
         let prt = FilmStockDatabase.printStock(withID: params.printStockID)
@@ -167,7 +170,6 @@ public struct SpektraCamMainView: View {
         }
     }
 
-    // MARK: - iPhone 13 Pro Max Triple Lens Selector (13mm / 26mm / 77mm)
     private var lensSelectorPill: some View {
         HStack(spacing: 6) {
             ForEach(iPhone13ProMaxLens.allCases) { lens in
@@ -186,7 +188,6 @@ public struct SpektraCamMainView: View {
         }
     }
 
-    // MARK: - Film Canister & Print Stock Horizontal Selector
     private var filmAndPrintCarousel: some View {
         VStack(spacing: 4) {
             ScrollView(.horizontal, showsIndicators: false) {
@@ -236,7 +237,6 @@ public struct SpektraCamMainView: View {
         }
     }
 
-    // MARK: - 7-Module Physical Darkroom Parameter Drawer
     private var darkroomParameterDrawer: some View {
         VStack(spacing: 6) {
             ScrollView(.horizontal, showsIndicators: false) {
@@ -352,7 +352,6 @@ public struct SpektraCamMainView: View {
         }
     }
 
-    // MARK: - Bottom Shutter & Dual-Track Log Video Control Deck
     private var bottomShutterDeck: some View {
         VStack(spacing: 6) {
             if cameraService.isCaptureModeVideo {
@@ -386,7 +385,6 @@ public struct SpektraCamMainView: View {
                         .cornerRadius(8)
                 }
 
-                // Main Shutter Button
                 Button {
                     if cameraService.isCaptureModeVideo {
                         cameraService.toggleVideoRecording()

@@ -3,8 +3,9 @@
 //  SpektraCam
 //
 //  A15 Bionic Zero-Copy Metal Compute Pipeline Manager
-//  Uses MTLHeap (Private Storage) & CVMetalTextureCache to stay strictly within
-//  iPhone 13 Pro Max 6GB LPDDR4X Unified Memory ceiling during 4K30 Log/Film and 12MP ProRAW capture.
+//  - Dynamically detects 8-bit (`r8Unorm`/`rg8Unorm`) vs 10-bit (`r16Unorm`/`rg16Unorm`) CVPixelBuffer planes
+//    to prevent CVMetalTextureCache nil binding or Metal validation aborts on launch.
+//  - Uses direct private MTLTextures with safe size checks.
 //
 
 import Foundation
@@ -17,7 +18,6 @@ public final class MetalFilmRenderer {
     public let device: MTLDevice
     public let commandQueue: MTLCommandQueue
     private var textureCache: CVMetalTextureCache?
-    private var transientHeap: MTLHeap?
 
     // Compute Pipeline States
     private let pipeYCbCr10ToLinearAndLog: MTLComputePipelineState
@@ -33,7 +33,7 @@ public final class MetalFilmRenderer {
     private let bufPrintDyeAndScanner: MTLBuffer
     private let bufCIE1931XYZ: MTLBuffer
 
-    // Intermediate Transient Textures (allocated from MTLHeap)
+    // Intermediate Transient Textures
     private var texSceneLinear: MTLTexture?
     private var texLogEncoded: MTLTexture?
     private var texEmulsionExposure: MTLTexture?
@@ -93,8 +93,9 @@ public final class MetalFilmRenderer {
         updateSpectralTablesIfNeeded(negID: "kodak_portra_400", printID: "kodak_endura_premier", sceneKelvin: 5500)
     }
 
-    // MARK: - Zero-Copy CVMetalTextureCache & MTLHeap Allocation (A15 6GB Safe)
+    // MARK: - Allocate Private GPU Working Textures (Capped at 1920x1440 for Real-Time Viewfinder Stability)
     public func ensureTransientTextures(width: Int, height: Int) {
+        guard width > 0 && height > 0 else { return }
         guard width != currentAllocatedSize.width || height != currentAllocatedSize.height else { return }
 
         let desc = MTLTextureDescriptor.texture2DDescriptor(
@@ -106,23 +107,12 @@ public final class MetalFilmRenderer {
         desc.usage = [.shaderRead, .shaderWrite]
         desc.storageMode = .private
 
-        let sizeAndAlign = device.heapTextureSizeAndAlign(descriptor: desc)
-        let totalHeapBytes = (sizeAndAlign.size + sizeAndAlign.align) * 5
-
-        let heapDesc = MTLHeapDescriptor()
-        heapDesc.size = totalHeapBytes
-        heapDesc.storageMode = .private
-        heapDesc.hazardTrackingMode = .tracked
-
-        if let heap = device.makeHeap(descriptor: heapDesc) {
-            self.transientHeap = heap
-            self.texSceneLinear = heap.makeTexture(descriptor: desc)
-            self.texLogEncoded = heap.makeTexture(descriptor: desc)
-            self.texEmulsionExposure = heap.makeTexture(descriptor: desc)
-            self.texScatteredExposure = heap.makeTexture(descriptor: desc)
-            self.texNegativeDensity = heap.makeTexture(descriptor: desc)
-            self.currentAllocatedSize = (width, height)
-        }
+        self.texSceneLinear = device.makeTexture(descriptor: desc)
+        self.texLogEncoded = device.makeTexture(descriptor: desc)
+        self.texEmulsionExposure = device.makeTexture(descriptor: desc)
+        self.texScatteredExposure = device.makeTexture(descriptor: desc)
+        self.texNegativeDensity = device.makeTexture(descriptor: desc)
+        self.currentAllocatedSize = (width, height)
     }
 
     // MARK: - Populate CIE 1931 2-Degree Standard Observer CMFs (380nm..780nm @ 5nm)
@@ -131,7 +121,6 @@ public final class MetalFilmRenderer {
         var ySum: Float = 0.0
         for i in 0..<81 {
             let lambda = Float(380 + i * 5)
-            // Wyman, Sloan & Shirley (2013) Multi-Lobe Piecewise Gaussian Fit to CIE 1931 2-deg CMFs
             let x1 = (lambda - 442.0) * ((lambda < 442.0) ? 0.0624 : 0.0374)
             let x2 = (lambda - 599.8) * ((lambda < 599.8) ? 0.0264 : 0.0323)
             let x3 = (lambda - 501.1) * ((lambda < 501.1) ? 0.0490 : 0.0382)
@@ -153,7 +142,6 @@ public final class MetalFilmRenderer {
         }
     }
 
-    // MARK: - Planckian Blackbody / CIE Daylight Illuminant Spectrum
     private func blackbodyNormalized(lambdaNM: Float, kelvin: Float) -> Float {
         let T = max(kelvin, 2000.0)
         let lamM = lambdaNM * 1e-9
@@ -194,7 +182,6 @@ public final class MetalFilmRenderer {
         }
     }
 
-    // MARK: - Build GPU Uniform Struct from User Parameters + Stock Profiles
     public func buildMetalUniforms(params: FilmSimulationParameters, imageWidth: Int) -> MetalFilmUniforms {
         let negStock = FilmStockDatabase.cameraStock(withID: params.negativeStockID)
         let printStock = FilmStockDatabase.printStock(withID: params.printStockID)
@@ -209,7 +196,6 @@ public final class MetalFilmRenderer {
         let pixelSizeUm = (gateMM * 1000.0) / Float(max(imageWidth, 1))
         let umToPx = 1.0 / max(pixelSizeUm, 0.5)
 
-        // Push/Pull process modulates effective gamma (~14% per stop) and base fog D_min
         let tempDelta = (params.devTemperatureCelsius - 37.8) * 0.04
         let pushGammaFactor = pow(1.14, params.pushPullStops) * (1.0 + tempDelta) * params.agitationIntensity
         let fogOffset = max(0.0, params.pushPullStops * 0.025 + tempDelta * 0.08)
@@ -225,7 +211,6 @@ public final class MetalFilmRenderer {
             : .zero
         let halPxRGB = negStock.halationSigmaMicrometers * umToPx
 
-        // Auto print exposure compensation counter-balances negative EV shifts for constant print brightness
         let netPrintEV = params.autoPrintExposureComp
             ? (params.printExposureEV - params.exposureCompensationEV * 0.62)
             : params.printExposureEV
@@ -292,46 +277,58 @@ public final class MetalFilmRenderer {
         outputDrawableTexture: MTLTexture
     ) -> (filmRenderedTexture: MTLTexture, logEncodedTexture: MTLTexture)? {
         guard let cache = textureCache else { return nil }
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
+        guard CVPixelBufferGetPlaneCount(pixelBuffer) >= 2 else { return nil }
+
+        let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+        let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+        let chromaW = CVPixelBufferGetWidthOfPlane(pixelBuffer, 1)
+        let chromaH = CVPixelBufferGetHeightOfPlane(pixelBuffer, 1)
+        guard width > 0 && height > 0 && chromaW > 0 && chromaH > 0 else { return nil }
+
         ensureTransientTextures(width: width, height: height)
 
         guard let texLinear = texSceneLinear,
               let texLog = texLogEncoded,
               let texExp = texEmulsionExposure,
               let texScat = texScatteredExposure,
-              let texNeg = texNegativeDensity,
-              let cmdBuf = commandQueue.makeCommandBuffer(),
-              let encoder = cmdBuf.makeComputeCommandEncoder() else {
+              let texNeg = texNegativeDensity else {
             return nil
         }
 
-        // Bind 10-bit Bi-Planar YCbCr planes zero-copy via CVMetalTextureCache
+        // Dynamically choose 16-bit vs 8-bit normalized pixel format based on actual CVPixelBuffer type
+        let ostype = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        let is10Bit = (ostype == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
+                       ostype == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
+        let lumaFormat: MTLPixelFormat = is10Bit ? .r16Unorm : .r8Unorm
+        let chromaFormat: MTLPixelFormat = is10Bit ? .rg16Unorm : .rg8Unorm
+
         var cvLuma: CVMetalTexture?
         var cvChroma: CVMetalTexture?
-        CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pixelBuffer, nil, .r16Unorm, width, height, 0, &cvLuma)
-        CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pixelBuffer, nil, .rg16Unorm, width / 2, height / 2, 1, &cvChroma)
+        CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pixelBuffer, nil, lumaFormat, width, height, 0, &cvLuma)
+        CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pixelBuffer, nil, chromaFormat, chromaW, chromaH, 1, &cvChroma)
 
         guard let lumaTex = cvLuma.flatMap({ CVMetalTextureGetTexture($0) }),
-              let chromaTex = cvChroma.flatMap({ CVMetalTextureGetTexture($0) }) else {
-            encoder.endEncoding()
+              let chromaTex = cvChroma.flatMap({ CVMetalTextureGetTexture($0) }),
+              let cmdBuf = commandQueue.makeCommandBuffer(),
+              let encoder = cmdBuf.makeComputeCommandEncoder() else {
             return nil
         }
 
         let tgSize = MTLSize(width: 16, height: 16, depth: 1)
         let tgCount = MTLSize(width: (width + 15) / 16, height: (height + 15) / 16, depth: 1)
 
-        // Stage 0: 10-bit HLG -> Scene Linear Rec.2020 + Custom Log
+        // Stage 0: YCbCr (8-bit or 10-bit) -> Scene Linear + Custom Log
         var logModeRaw = Int32(logCurve.rawValue)
+        var is10BitFlag: Int32 = is10Bit ? 1 : 0
         encoder.setComputePipelineState(pipeYCbCr10ToLinearAndLog)
         encoder.setTexture(lumaTex, index: 0)
         encoder.setTexture(chromaTex, index: 1)
         encoder.setTexture(texLinear, index: 2)
         encoder.setTexture(texLog, index: 3)
         encoder.setBytes(&logModeRaw, length: MemoryLayout<Int32>.stride, index: 0)
+        encoder.setBytes(&is10BitFlag, length: MemoryLayout<Int32>.stride, index: 1)
         encoder.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
 
-        // Build Physical Darkroom Uniforms
         var uniforms = buildMetalUniforms(params: params, imageWidth: width)
 
         // Stage 1: Spectral Upsampling & Emulsion Integration
@@ -356,7 +353,11 @@ public final class MetalFilmRenderer {
         encoder.setBytes(&uniforms, length: MemoryLayout<MetalFilmUniforms>.stride, index: 0)
         encoder.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
 
-        // Stage 4: Enlarger Dichroic Print + Stochastic Multi-Layer Grain + CIE 1931 Output
+        // Stage 4: Enlarger Dichroic Print + Stochastic Multi-Layer Grain + CIE 1931 Output (dispatched at drawable resolution)
+        let dstW = outputDrawableTexture.width
+        let dstH = outputDrawableTexture.height
+        let dstTGCount = MTLSize(width: (dstW + 15) / 16, height: (dstH + 15) / 16, depth: 1)
+
         encoder.setComputePipelineState(pipeEnlargerPrintAndGrain)
         encoder.setTexture(texNeg, index: 0)
         encoder.setTexture(outputDrawableTexture, index: 1)
@@ -365,7 +366,7 @@ public final class MetalFilmRenderer {
         encoder.setBuffer(bufPrintSens, offset: 0, index: 2)
         encoder.setBuffer(bufPrintDyeAndScanner, offset: 0, index: 3)
         encoder.setBuffer(bufCIE1931XYZ, offset: 0, index: 4)
-        encoder.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
+        encoder.dispatchThreadgroups(dstTGCount, threadsPerThreadgroup: tgSize)
 
         encoder.endEncoding()
         cmdBuf.commit()
