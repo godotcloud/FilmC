@@ -77,8 +77,9 @@ inline float jakob_hanika_sigmoid(float x) {
 }
 
 // Reconstruct polynomial coefficients (c0, c1, c2) for normalized wavelength u in [0, 1] (380nm..780nm)
-// Fitted analytical closed-form projection from linear Rec.2020 tristimulus chromaticity
-inline float3 compute_jakob_hanika_coeffs(float3 rgb_rec2020, out float &albedoScale) {
+// Fitted analytical closed-form projection from linear Rec.2020 tristimulus chromaticity.
+// Uses explicit `thread float &albedoScale` address space as required by Metal Shading Language (MSL).
+inline float3 compute_jakob_hanika_coeffs(float3 rgb_rec2020, thread float &albedoScale) {
     float maxComp = max(max(rgb_rec2020.r, rgb_rec2020.g), max(rgb_rec2020.b, 1e-5f));
     // Scale brighter than unity so reflectance stays strictly within (0, 1)
     albedoScale = max(1.0f, maxComp * 1.05f);
@@ -124,7 +125,7 @@ inline float3 evaluate_hd_curve(
 }
 
 // ============================================================================
-//Helper: PCG3D Deterministic Hash for Stochastic Silver Halide Particle Grain
+// Helper: PCG3D Deterministic Hash for Stochastic Silver Halide Particle Grain
 // ============================================================================
 inline uint3 pcg3d(uint3 v) {
     v = v * 1664525u + 1013904223u;
@@ -172,7 +173,7 @@ inline float3 encode_custom_log(float3 linearRGB, int logMode) {
         const float b  = 0.00964052f;
         const float y  = 0.08550479f;
         const float d  = 0.69336945f;
-        float3 outLog;
+        float3 outLog = float3(0.0f);
         for (int i = 0; i < 3; ++i) {
             float v = x[i];
             if (v < r0) outLog[i] = 0.0f;
@@ -189,7 +190,7 @@ inline float3 encode_custom_log(float3 linearRGB, int logMode) {
         const float d = 0.385537f;
         const float e = 5.367655f;
         const float f = 0.092809f;
-        float3 outLog;
+        float3 outLog = float3(0.0f);
         for (int i = 0; i < 3; ++i) {
             float v = x[i];
             outLog[i] = (v > cut) ? (c * log10(a * v + b) + d) : (e * v + f);
@@ -554,7 +555,7 @@ kernel void kernel_enlarger_print_and_grain(
     }
 
     // Encode display transfer function (sRGB/P3 EOTF^-1 or BT.2100 HLG OETF)
-    float3 encodedOut;
+    float3 encodedOut = float3(0.0f);
     if (u.outputColorSpace == 2) {
         // BT.2100 HLG OETF
         const float a = 0.17883277f;
