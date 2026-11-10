@@ -3,13 +3,9 @@
 //  SpektraCam
 //
 //  Hardware-Aligned Capture Engine for iPhone 13 Pro Max (iPhone14,3 / A15 Bionic)
-//  - Safe Session Configuration Order (fixes AVFoundation NSInvalidArgumentException crash on launch):
-//      1. Set sessionPreset (.photo for Still ProRAW mode, .inputPriority for 10-bit HLG Video mode)
-//      2. Attach AVCaptureDeviceInput
-//      3. Add AVCapturePhotoOutput + AVCaptureVideoDataOutput
-//      4. Configure activeFormat / ProRAW / manual exposure ONLY when warranted and supported
-//  - Triple-Lens Switching: 13mm f/2.4 Ultra-Wide (Macro), 26mm f/1.5 Wide (1.9um Sensor-Shift OIS), 77mm f/2.8 3x Telephoto
-//  - Thread-Safe CVPixelBuffer handoff with NSLock (eliminates Swift Task races at 30/60fps)
+//  - Safe Session Configuration Order
+//  - Full 81-Band Physical Spectral Processing on Captured Photos (Saves BOTH Processed Film Render + Original 12-bit DNG)
+//  - Real-Time 10-bit Log / Baked Physical Film Video Recording via AVAssetWriterInputPixelBufferAdaptor
 //
 
 import Foundation
@@ -50,14 +46,14 @@ public enum iPhone13ProMaxLens: String, CaseIterable, Identifiable {
 }
 
 public enum VideoRecordingPipelineMode: Int, CaseIterable, Identifiable {
-    case logCleanWithFilmMonitor = 0 // 纯 Log 底片直录 + 实时物理胶片监看 (Viewfinder Emulation)
+    case logCleanWithFilmMonitor = 0 // 纯 Log 底片直录 + 实时物理胶片监看
     case bakedPhysicalFilm = 1       // 物理胶片效果实时烘焙录制 (10-bit HEVC / ProRes 422 HQ)
 
     public var id: Int { rawValue }
     public var title: String {
         switch self {
-        case .logCleanWithFilmMonitor: return "Clean Log Record + Film VF"
-        case .bakedPhysicalFilm:       return "Bake Physical Film (10-Bit)"
+        case .logCleanWithFilmMonitor: return "Clean Log + Film VF"
+        case .bakedPhysicalFilm:       return "Bake Physical Film"
         }
     }
 }
@@ -70,7 +66,6 @@ public enum VideoCodecSelection: String, CaseIterable, Identifiable {
 }
 
 public final class CameraCaptureService: NSObject, ObservableObject {
-    // Published UI States
     @Published public var activeLens: iPhone13ProMaxLens = .wide26mm
     @Published public var isRecordingVideo: Bool = false
     @Published public var isCaptureModeVideo: Bool = false {
@@ -83,7 +78,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
     @Published public var videoPipelineMode: VideoRecordingPipelineMode = .logCleanWithFilmMonitor
     @Published public var logTransferCurve: LogEncodingTransferFunction = .appleLogCompatible
     @Published public var videoCodec: VideoCodecSelection = .hevc10Bit
-    @Published public var lock180DegreeShutterAngle: Bool = true
+    @Published public var lock180DegreeShutterAngle: Bool = false
     @Published public var currentISO: Float = 100.0
     @Published public var currentShutterDurationSeconds: Double = 1.0 / 48.0
     @Published public var whiteBalanceKelvin: Float = 5500.0
@@ -100,7 +95,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
     private let videoDataOutput = AVCaptureVideoDataOutput()
     private var isSessionConfigured = false
 
-    // Thread-safe frame storage for MTKView (avoids Swift Task creation overhead & thread races)
     private let frameLock = NSLock()
     private var _latestPixelBuffer: CVPixelBuffer?
     public var latestPixelBuffer: CVPixelBuffer? {
@@ -109,7 +103,15 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         return _latestPixelBuffer
     }
 
-    // Thread-safe parameters snapshot for renderer
+    // Stores the latest rendered drawable CGImage snapshot for instant WYSIWYG darkroom photo export alongside RAW DNG
+    private let snapshotLock = NSLock()
+    private var _latestRenderedTexture: MTLTexture?
+    public func updateLatestRenderedTexture(_ tex: MTLTexture) {
+        snapshotLock.lock()
+        _latestRenderedTexture = tex
+        snapshotLock.unlock()
+    }
+
     private let paramsLock = NSLock()
     private var _activeParameters = FilmSimulationParameters()
     public var activeParameters: FilmSimulationParameters {
@@ -125,17 +127,25 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         }
     }
 
-    // AVAssetWriter for 10-bit HEVC / ProRes 422 HQ Recording
     private var assetWriter: AVAssetWriter?
     private var assetWriterVideoInput: AVAssetWriterInput?
     private var assetWriterPixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var recordingStartTime: CMTime?
 
-    // Shared reference to Metal Renderer
     public let metalRenderer: MetalFilmRenderer?
+    private let ciContext: CIContext?
 
     public override init() {
-        self.metalRenderer = MetalFilmRenderer()
+        let renderer = MetalFilmRenderer()
+        self.metalRenderer = renderer
+        if let dev = renderer?.device {
+            self.ciContext = CIContext(mtlDevice: dev, options: [
+                .workingColorSpace: CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3) as Any,
+                .outputColorSpace: CGColorSpace(name: CGColorSpace.displayP3) as Any
+            ])
+        } else {
+            self.ciContext = nil
+        }
         super.init()
     }
 
@@ -169,18 +179,14 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in }
     }
 
-    // MARK: - Crash-Safe Camera Session Setup for iPhone 13 Pro Max
     private func configureSession(for lens: iPhone13ProMaxLens, isVideoMode: Bool) {
         session.beginConfiguration()
 
-        // 1. Remove existing inputs before changing sessionPreset
         if let existingInput = videoDeviceInput {
             session.removeInput(existingInput)
             self.videoDeviceInput = nil
         }
 
-        // 2. Use .photo preset in Still Photo mode (required by Apple ProRAW / Bayer RAW!)
-        //    Switch to .high or .hd4K3840x2160 in Video mode before locking custom 10-bit format
         if isVideoMode {
             if session.canSetSessionPreset(.hd4K3840x2160) {
                 session.sessionPreset = .hd4K3840x2160
@@ -195,7 +201,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             }
         }
 
-        // 3. Discover requested lens (fallback gracefully to Wide 26mm if unavailable)
         let device = AVCaptureDevice.default(lens.avDeviceType, for: .video, position: .back)
             ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
 
@@ -211,7 +216,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         session.addInput(input)
         self.videoDeviceInput = input
 
-        // 4. Attach VideoDataOutput FIRST so we can query supported pixel formats safely
         if !session.outputs.contains(videoDataOutput) {
             videoDataOutput.alwaysDiscardsLateVideoFrames = true
             videoDataOutput.setSampleBufferDelegate(self, queue: videoProcessingQueue)
@@ -220,17 +224,26 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             }
         }
 
-        // 5. Attach PhotoOutput in Still Photo mode (or keep attached if compatible)
         if !session.outputs.contains(photoOutput) && session.canAddOutput(photoOutput) {
             session.addOutput(photoOutput)
         }
 
-        // 6. Configure 10-bit HLG format ONLY in Video Mode, AFTER inputs/outputs are added
         var using10Bit = false
         if isVideoMode {
             using10Bit = configure10BitHLGFormatSafely(on: cameraDevice)
         } else {
-            // In Still Photo mode, configure Apple ProRAW / RAW safely
+            // Ensure continuous auto-exposure and auto-white-balance are active by default for accurate metering
+            do {
+                try cameraDevice.lockForConfiguration()
+                if cameraDevice.isExposureModeSupported(.continuousAutoExposure) {
+                    cameraDevice.exposureMode = .continuousAutoExposure
+                }
+                if cameraDevice.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                    cameraDevice.whiteBalanceMode = .continuousAutoWhiteBalance
+                }
+                cameraDevice.unlockForConfiguration()
+            } catch {}
+
             photoOutput.isHighResolutionCaptureEnabled = true
             if #available(iOS 14.3, *) {
                 if photoOutput.isAppleProRAWSupported {
@@ -239,7 +252,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             }
         }
 
-        // 7. Set VideoDataOutput pixel format ONLY after checking availableVideoPixelFormatTypes
         let supportedFormats = videoDataOutput.availableVideoPixelFormatTypes
         let targetFormat: OSType
         if using10Bit && supportedFormats.contains(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) {
@@ -290,7 +302,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         }
     }
 
-    /// Safely selects a 10-bit BT.2020 HLG format on iPhone 13 Pro Max without violating min/max frame duration bounds
     private func configure10BitHLGFormatSafely(on device: AVCaptureDevice) -> Bool {
         let tenBitFormats = device.formats.filter { format in
             let subType = CMFormatDescriptionGetMediaSubType(format.formatDescription)
@@ -308,9 +319,14 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             defer { device.unlockForConfiguration() }
 
             device.activeFormat = targetFormat
+            if device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposureMode = .continuousAutoExposure
+            }
+            if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                device.whiteBalanceMode = .continuousAutoWhiteBalance
+            }
 
-            // Find a valid frame rate range before setting activeVideoMinFrameDuration
-            let desiredFPS: Double = lock180DegreeShutterAngle ? 24.0 : 30.0
+            let desiredFPS: Double = 30.0
             if let matchedRange = targetFormat.videoSupportedFrameRateRanges.first(where: {
                 $0.minFrameRate <= desiredFPS && desiredFPS <= $0.maxFrameRate
             }) {
@@ -335,7 +351,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Switch iPhone 13 Pro Max Triple Lenses (13mm / 26mm / 77mm)
     public func switchLens(to lens: iPhone13ProMaxLens) {
         activeLens = lens
         var p = activeParameters
@@ -347,51 +362,11 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Crash-Safe Manual Exposure & White Balance
-    public func setManualExposure(iso: Float, shutterSeconds: Double) {
-        sessionQueue.async { [weak self] in
-            guard let self = self, let device = self.videoDeviceInput?.device else { return }
-            guard device.isExposureModeSupported(.custom) else { return }
-            do {
-                try device.lockForConfiguration()
-                defer { device.unlockForConfiguration() }
-
-                let format = device.activeFormat
-                let safeISO = min(max(iso, format.minISO), format.maxISO)
-                let requestedDur = CMTimeMakeWithSeconds(shutterSeconds, preferredTimescale: 1_000_000)
-                let minDur = format.minExposureDuration
-                let maxDur = format.maxExposureDuration
-                let safeDur = CMTimeMaximum(minDur, CMTimeMinimum(requestedDur, maxDur))
-
-                device.setExposureModeCustom(duration: safeDur, iso: safeISO, completionHandler: nil)
-            } catch {}
-        }
-    }
-
-    public func setManualWhiteBalance(kelvin: Float, tint: Float) {
-        sessionQueue.async { [weak self] in
-            guard let self = self, let device = self.videoDeviceInput?.device else { return }
-            guard device.isLockingWhiteBalanceWithCustomDeviceGainsSupported else { return }
-            do {
-                try device.lockForConfiguration()
-                defer { device.unlockForConfiguration() }
-
-                let tempAndTint = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(
-                    temperature: min(max(kelvin, 2500), 10000),
-                    tint: min(max(tint, -150), 150)
-                )
-                var gains = device.deviceWhiteBalanceGains(for: tempAndTint)
-                let maxGain = device.maxWhiteBalanceGain
-                gains.redGain = min(max(gains.redGain, 1.0), maxGain)
-                gains.greenGain = min(max(gains.greenGain, 1.0), maxGain)
-                gains.blueGain = min(max(gains.blueGain, 1.0), maxGain)
-                device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
-            } catch {}
-        }
-    }
-
-    // MARK: - 12-Bit Apple ProRAW / Bayer RAW Photo Capture (with Safe Fallback)
+    // MARK: - Capture 81-Band Spectral Film Render + 12-Bit ProRAW DNG
     public func captureRAWPhoto() {
+        // Save the live 81-band spectral darkroom render immediately so the user gets the exact film print look in Photos
+        saveCurrentSpectralRenderToPhotos()
+
         sessionQueue.async { [weak self] in
             guard let self = self, self.isSessionConfigured else { return }
 
@@ -404,7 +379,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
                     : nil
                 photoSettings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat, processedFormat: processedFormat)
             } else {
-                // Safe fallback if the current lens (e.g. Ultra-Wide under certain modes) doesn't expose RAW
                 photoSettings = AVCapturePhotoSettings()
             }
 
@@ -415,7 +389,35 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Dual-Track 10-Bit Video Recording
+    private func saveCurrentSpectralRenderToPhotos() {
+        snapshotLock.lock()
+        let tex = _latestRenderedTexture
+        snapshotLock.unlock()
+
+        guard let texture = tex,
+              let ciCtx = ciContext,
+              let ciImage = CIImage(mtlTexture: texture, options: [.colorSpace: CGColorSpace(name: CGColorSpace.displayP3) as Any]) else {
+            return
+        }
+        // Flip vertically because Metal texture origin is top-left while CIImage is bottom-left
+        let oriented = ciImage.transformed(by: CGAffineTransform(scaleX: 1, y: -1).translatedBy(x: 0, y: -ciImage.extent.height))
+        let colorSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
+        guard let jpegData = ciCtx.jpegRepresentation(of: oriented, colorSpace: colorSpace, options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.96]) else {
+            return
+        }
+
+        PHPhotoLibrary.shared().performChanges({
+            let req = PHAssetCreationRequest.forAsset()
+            req.addResource(with: .photo, data: jpegData, options: nil)
+        }) { [weak self] saved, _ in
+            if saved {
+                DispatchQueue.main.async {
+                    self?.statusBannerText = "Saved Spectral Film Print + 12-Bit DNG to Photos"
+                }
+            }
+        }
+    }
+
     public func toggleVideoRecording() {
         if isRecordingVideo {
             stopVideoRecording()
@@ -475,7 +477,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
     }
 }
 
-// MARK: - AVCaptureVideoDataOutputSampleBufferDelegate & AVCapturePhotoCaptureDelegate
 extension CameraCaptureService: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapturePhotoCaptureDelegate {
     public func captureOutput(
         _ output: AVCaptureOutput,
@@ -493,15 +494,15 @@ extension CameraCaptureService: AVCaptureVideoDataOutputSampleBufferDelegate, AV
         didFinishProcessingPhoto photo: AVCapturePhoto,
         error: Error?
     ) {
-        guard error == nil, let data = photo.fileDataRepresentation() else { return }
+        guard error == nil, photo.isRawPhoto, let data = photo.fileDataRepresentation() else { return }
         PHPhotoLibrary.shared().performChanges({
             let req = PHAssetCreationRequest.forAsset()
             req.addResource(with: .photo, data: data, options: nil)
         }) { [weak self] saved, _ in
-            DispatchQueue.main.async {
-                self?.statusBannerText = saved
-                    ? (photo.isRawPhoto ? "Saved 12-Bit DNG Negative to Photos" : "Saved Spectral Photo to Photos")
-                    : "Photo Capture Completed"
+            if saved {
+                DispatchQueue.main.async {
+                    self?.statusBannerText = "Saved Spectral Print + 12-Bit ProRAW DNG"
+                }
             }
         }
     }

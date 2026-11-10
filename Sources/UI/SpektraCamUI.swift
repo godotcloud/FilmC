@@ -2,16 +2,16 @@
 //  SpektraCamUI.swift
 //  SpektraCam
 //
-//  Native Darkroom UI & 120Hz ProMotion MetalKit Viewfinder for iPhone 13 Pro Max (6.7" 428x926 pt)
-//  Uses `.bgra8Unorm` (with Display P3 wide gamut) which natively supports `MTLTextureUsage.shaderWrite`
-//  across all iOS 16+ CAMetalLayer configurations without triggering drawable validation crashes.
+//  Native Darkroom UI & ProMotion MetalKit Viewfinder for iPhone 13 Pro Max (6.7" 428x926 pt)
+//  - Fixed Viewfinder Aspect Ratio & Orientation (3:4 Portrait in Photo Mode, 16:9 in Video Mode with Aspect-Fill Center Crop)
+//  - Responsive Compact Layout so Viewfinder + Film Canisters + 7-Module Darkroom Inspector fit cleanly on 428x926 pt screen
 //
 
 import SwiftUI
 import MetalKit
 import CoreVideo
 
-// MARK: - 120Hz ProMotion MetalKit Real-Time Spectral Viewfinder
+// MARK: - ProMotion MetalKit Real-Time Spectral Viewfinder
 public struct MetalFilmViewfinder: UIViewRepresentable {
     @ObservedObject var cameraService: CameraCaptureService
     @Binding var params: FilmSimulationParameters
@@ -23,8 +23,8 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
     public func makeUIView(context: Context) -> MTKView {
         let mtkView = MTKView()
         mtkView.device = cameraService.metalRenderer?.device
-        mtkView.framebufferOnly = false // Required for Compute Shader write access to drawable.texture
-        mtkView.colorPixelFormat = .bgra8Unorm // Guaranteed shaderWrite support on all iOS CAMetalLayers
+        mtkView.framebufferOnly = false
+        mtkView.colorPixelFormat = .bgra8Unorm
         mtkView.preferredFramesPerSecond = 60
         mtkView.enableSetNeedsDisplay = false
         mtkView.isPaused = false
@@ -55,7 +55,6 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
             guard let drawable = view.currentDrawable else { return }
             guard let pb = cameraService.latestPixelBuffer,
                   let renderer = cameraService.metalRenderer else {
-                // If camera hasn't delivered the first frame yet, present a clean darkroom clear pass
                 if let cmdBuf = cameraService.metalRenderer?.commandQueue.makeCommandBuffer(),
                    let rpd = view.currentRenderPassDescriptor,
                    let enc = cmdBuf.makeRenderCommandEncoder(descriptor: rpd) {
@@ -66,12 +65,13 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
                 return
             }
 
-            if renderer.processVideoSampleBuffer(
+            if let result = renderer.processVideoSampleBuffer(
                 pixelBuffer: pb,
                 params: currentParams,
                 logCurve: logCurve,
                 outputDrawableTexture: drawable.texture
-            ) != nil {
+            ) {
+                cameraService.updateLatestRenderedTexture(result.filmRenderedTexture)
                 drawable.present()
             }
         }
@@ -108,18 +108,39 @@ public struct SpektraCamMainView: View {
                 // 1. Top Telemetry Bar
                 topTelemetryHeader
 
-                // 2. Real-Time Metal Spectral Viewfinder
+                // 2. Real-Time Metal Spectral Viewfinder (Aspect-Fill Center-Cropped in Shader, Zero Distortion)
                 ZStack(alignment: .bottomLeading) {
                     MetalFilmViewfinder(cameraService: cameraService, params: $params)
-                        .aspectRatio(cameraService.isCaptureModeVideo ? 16.0/9.0 : 3.0/4.0, contentMode: .fit)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .aspectRatio(cameraService.isCaptureModeVideo ? (16.0 / 9.0) : (3.0 / 4.0), contentMode: .fit)
+                        .frame(maxWidth: .infinity)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
                         .overlay(
-                            RoundedRectangle(cornerRadius: 10)
+                            RoundedRectangle(cornerRadius: 12)
                                 .stroke(Color.orange.opacity(0.45), lineWidth: 1)
                         )
 
-                    lensSelectorPill
-                        .padding(10)
+                    HStack {
+                        lensSelectorPill
+                        Spacer()
+                        Button {
+                            // One-tap Reset Darkroom Parameters to Calibrated Factory Neutral
+                            let currentNeg = params.negativeStockID
+                            let currentPrt = params.printStockID
+                            var fresh = FilmSimulationParameters()
+                            fresh.negativeStockID = currentNeg
+                            fresh.printStockID = currentPrt
+                            params = fresh
+                        } label: {
+                            Text("RESET")
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 5)
+                                .background(Color.black.opacity(0.65))
+                                .cornerRadius(12)
+                        }
+                    }
+                    .padding(10)
                 }
 
                 // 3. Film Canister & Print Paper Carousel
@@ -131,11 +152,14 @@ public struct SpektraCamMainView: View {
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
+                Spacer(minLength: 0)
+
                 // 5. Shutter, Capture Mode & Dual-Track Log Controls
                 bottomShutterDeck
             }
             .padding(.horizontal, 10)
-            .padding(.vertical, 4)
+            .padding(.top, 2)
+            .padding(.bottom, 6)
         }
         .preferredColorScheme(.dark)
         .onAppear {
@@ -205,7 +229,7 @@ public struct SpektraCamMainView: View {
                                     .foregroundColor(params.negativeStockID == stock.id ? .black.opacity(0.8) : .gray)
                             }
                             .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
+                            .padding(.vertical, 5)
                             .background(params.negativeStockID == stock.id ? Color.orange : Color(white: 0.14))
                             .cornerRadius(8)
                         }
@@ -238,7 +262,7 @@ public struct SpektraCamMainView: View {
     }
 
     private var darkroomParameterDrawer: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 5) {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
                     ForEach(DarkroomInspectorTab.allCases) { tab in
@@ -330,7 +354,7 @@ public struct SpektraCamMainView: View {
                 }
                 .padding(8)
             }
-            .frame(height: 155)
+            .frame(height: 145)
             .background(Color(white: 0.09))
             .cornerRadius(10)
         }
@@ -395,11 +419,11 @@ public struct SpektraCamMainView: View {
                     ZStack {
                         Circle()
                             .stroke(Color.white, lineWidth: 3)
-                            .frame(width: 66, height: 66)
+                            .frame(width: 64, height: 64)
                         Circle()
                             .fill(cameraService.isCaptureModeVideo ? Color.red : Color.orange)
-                            .frame(width: cameraService.isRecordingVideo ? 32 : 54,
-                                   height: cameraService.isRecordingVideo ? 32 : 54)
+                            .frame(width: cameraService.isRecordingVideo ? 30 : 52,
+                                   height: cameraService.isRecordingVideo ? 30 : 52)
                             .animation(.easeInOut(duration: 0.2), value: cameraService.isRecordingVideo)
                     }
                 }
