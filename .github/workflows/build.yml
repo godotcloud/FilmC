@@ -1,0 +1,102 @@
+name: Build Uncompressed iOS SpektraCam (iPhone 13 Pro Max)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-uncompressed-ipa:
+    name: Build Unsigned & Ad-Hoc Signed Uncompressed IPA (arm64)
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Select Stable Xcode Toolchain
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+          xcrun metal -v
+
+      - name: Install XcodeGen & ldid
+        run: |
+          if ! command -v xcodegen &> /dev/null; then
+            brew install xcodegen
+          fi
+          if ! command -v ldid &> /dev/null; then
+            brew install ldid
+          fi
+
+      - name: Generate Xcode Project via XcodeGen (project.yml)
+        run: |
+          xcodegen generate --spec project.yml
+          ls -la SpektraCam.xcodeproj
+
+      - name: Pre-Verify Metal Compute Shader Compilation (A15 Apple GPU Family 8)
+        run: |
+          xcrun -sdk iphoneos metal -c -std=ios-metal2.4 -mios-version-min=16.0 \
+            Sources/Metal/SpectralPipeline.metal -o /tmp/SpectralPipeline.air
+          xcrun -sdk iphoneos metallib /tmp/SpectralPipeline.air -o /tmp/default.metallib
+          ls -lh /tmp/default.metallib
+
+      - name: Build Release arm64 iOS App (No Code Signing Required)
+        run: |
+          xcodebuild clean build \
+            -project SpektraCam.xcodeproj \
+            -scheme SpektraCam \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "${RUNNER_TEMP}/DerivedData" \
+            ARCHS="arm64" \
+            ONLY_ACTIVE_ARCH=NO \
+            IPHONEOS_DEPLOYMENT_TARGET="16.0" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO
+
+      - name: Ad-Hoc Sign & ldid Entitlements Stamp (SideStore / AltStore / TrollStore Ready)
+        run: |
+          APP_PATH="${RUNNER_TEMP}/DerivedData/Build/Products/Release-iphoneos/SpektraCam.app"
+          if [ ! -d "${APP_PATH}" ]; then
+            echo "Error: SpektraCam.app not found at ${APP_PATH}"
+            exit 1
+          fi
+          # Remove any stale _CodeSignature if present and apply Ad-Hoc signature + ldid
+          rm -rf "${APP_PATH}/_CodeSignature"
+          ldid -S "${APP_PATH}/SpektraCam"
+          codesign --force --deep --sign - --timestamp=none "${APP_PATH}"
+          codesign -vvv "${APP_PATH}" || true
+
+      - name: Package Stage-1 Zero-Compression IPA (zip -0 Store Mode)
+        run: |
+          APP_PATH="${RUNNER_TEMP}/DerivedData/Build/Products/Release-iphoneos/SpektraCam.app"
+          STAGE_DIR="${RUNNER_TEMP}/IPA_Staging"
+          mkdir -p "${STAGE_DIR}/Payload"
+          cp -R "${APP_PATH}" "${STAGE_DIR}/Payload/SpektraCam.app"
+
+          cd "${STAGE_DIR}"
+          # CRITICAL: -0 enforces STORE mode (zero deflate compression), -r recursive, -y preserve symlinks
+          zip -0 -r -y "${GITHUB_WORKSPACE}/SpektraCam-Unsigned-Uncompressed.ipa" Payload
+          ls -lh "${GITHUB_WORKSPACE}/SpektraCam-Unsigned-Uncompressed.ipa"
+
+      - name: Upload Stage-2 Zero-Compression IPA Artifact (compression-level 0)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpektraCam-iPhone13ProMax-Uncompressed-IPA
+          path: ${{ github.workspace }}/SpektraCam-Unsigned-Uncompressed.ipa
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload Raw Uncompressed SpektraCam.app Bundle (compression-level 0)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpektraCam-Raw-App-Bundle-Uncompressed
+          path: ${{ runner.temp }}/DerivedData/Build/Products/Release-iphoneos/SpektraCam.app
+          compression-level: 0
+          if-no-files-found: error
