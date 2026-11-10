@@ -7,6 +7,7 @@
 //    1. Spectral Sensitivity Pre-Normalization against Reference Scene Illuminant (18% Gray -> (0.18, 0.18, 0.18))
 //    2. Enlarger Neutral Gray Auto-Calibration against 18% Developed Negative Density (Eliminates Color Cast)
 //    3. Print Dye Equal-Area Normalization + Scanner D65 White-Patch Calibration (Guarantees Neutral Gray stays Neutral from Shadows to Highlights!)
+//  - Strict Swift 5.9 SIMD3<Float> & Float32 explicit typing (Zero ambiguous `.zero` or `pow` overload conflicts)
 //
 
 import Foundation
@@ -117,33 +118,37 @@ public final class MetalFilmRenderer {
         var ySum: Float = 0.0
         for i in 0..<81 {
             let lambda = Float(380 + i * 5)
-            let x1 = (lambda - 442.0) * ((lambda < 442.0) ? 0.0624 : 0.0374)
-            let x2 = (lambda - 599.8) * ((lambda < 599.8) ? 0.0264 : 0.0323)
-            let x3 = (lambda - 501.1) * ((lambda < 501.1) ? 0.0490 : 0.0382)
-            let xBar = 0.362 * exp(-0.5 * x1 * x1) + 1.056 * exp(-0.5 * x2 * x2) - 0.065 * exp(-0.5 * x3 * x3)
+            let x1: Float = (lambda - 442.0) * ((lambda < 442.0) ? 0.0624 : 0.0374)
+            let x2: Float = (lambda - 599.8) * ((lambda < 599.8) ? 0.0264 : 0.0323)
+            let x3: Float = (lambda - 501.1) * ((lambda < 501.1) ? 0.0490 : 0.0382)
+            let xBar: Float = 0.362 * expf(-0.5 * x1 * x1) + 1.056 * expf(-0.5 * x2 * x2) - 0.065 * expf(-0.5 * x3 * x3)
 
-            let y1 = (lambda - 568.8) * ((lambda < 568.8) ? 0.0213 : 0.0247)
-            let y2 = (lambda - 530.9) * ((lambda < 530.9) ? 0.0613 : 0.0322)
-            let yBar = 0.821 * exp(-0.5 * y1 * y1) + 0.286 * exp(-0.5 * y2 * y2)
+            let y1: Float = (lambda - 568.8) * ((lambda < 568.8) ? 0.0213 : 0.0247)
+            let y2: Float = (lambda - 530.9) * ((lambda < 530.9) ? 0.0613 : 0.0322)
+            let yBar: Float = 0.821 * expf(-0.5 * y1 * y1) + 0.286 * expf(-0.5 * y2 * y2)
 
-            let z1 = (lambda - 437.0) * ((lambda < 437.0) ? 0.0845 : 0.0278)
-            let z2 = (lambda - 459.0) * ((lambda < 459.0) ? 0.0385 : 0.0725)
-            let zBar = 1.217 * exp(-0.5 * z1 * z1) + 0.681 * exp(-0.5 * z2 * z2)
+            let z1: Float = (lambda - 437.0) * ((lambda < 437.0) ? 0.0845 : 0.0278)
+            let z2: Float = (lambda - 459.0) * ((lambda < 459.0) ? 0.0385 : 0.0725)
+            let zBar: Float = 1.217 * expf(-0.5 * z1 * z1) + 0.681 * expf(-0.5 * z2 * z2)
 
-            ptr[i] = SIMD4<Float>(max(xBar, 0), max(yBar, 0), max(zBar, 0), 0)
-            ySum += max(yBar, 0)
+            let cx = max(xBar, 0.0)
+            let cy = max(yBar, 0.0)
+            let cz = max(zBar, 0.0)
+            ptr[i] = SIMD4<Float>(cx, cy, cz, 0.0)
+            ySum += cy
         }
+        let invYSum = 1.0 / max(ySum, 1e-5)
         for i in 0..<81 {
-            ptr[i] /= max(ySum, 1e-5)
+            ptr[i] *= invYSum
         }
     }
 
     private func blackbodyNormalized(lambdaNM: Float, kelvin: Float) -> Float {
-        let T = max(kelvin, 2000.0)
-        let lamM = lambdaNM * 1e-9
+        let T: Float = max(kelvin, 2000.0)
+        let lamM: Float = lambdaNM * 1e-9
         let c2: Float = 1.438777e-2
-        let val = (1.0 / pow(lamM, 5.0)) / (exp(c2 / (lamM * T)) - 1.0)
-        let ref555 = (1.0 / pow(555e-9, 5.0)) / (exp(c2 / (555e-9 * T)) - 1.0)
+        let val: Float = (1.0 / powf(lamM, 5.0)) / (expf(c2 / (lamM * T)) - 1.0)
+        let ref555: Float = (1.0 / powf(555e-9, 5.0)) / (expf(c2 / (555e-9 * T)) - 1.0)
         return val / max(ref555, 1e-12)
     }
 
@@ -162,7 +167,7 @@ public final class MetalFilmRenderer {
         let negSens = negStock.evaluateSpectralSensitivities81()
         let negDye = negStock.evaluateDyeSpectralDensities81()
         let prtSens = printStock.evaluateSpectralSensitivities81()
-        var prtDye = printStock.evaluateDyeSpectralDensities81()
+        let prtDye = printStock.evaluateDyeSpectralDensities81()
 
         let ptrSens = bufSpectralSensitivity.contents().bindMemory(to: SIMD4<Float>.self, capacity: 81)
         let ptrNegDye = bufNegDyeAndEnlarger.contents().bindMemory(to: SIMD4<Float>.self, capacity: 81)
@@ -192,8 +197,9 @@ public final class MetalFilmRenderer {
             let enlargerIllum = blackbodyNormalized(lambdaNM: lambda, kelvin: 3200.0)
             ptrNegDye[i] = SIMD4<Float>(negDye[i].x, negDye[i].y, negDye[i].z, enlargerIllum)
 
-            let negSpecD = dot(midNetNeg, negDye[i])
-            let trans = pow(10.0, -min(max(negSpecD, -2.0), 4.5))
+            let negSpecD: Float = simd_dot(midNetNeg, negDye[i])
+            let clampedSpecD: Float = min(max(negSpecD, -2.0), 4.5)
+            let trans: Float = powf(10.0, -clampedSpecD)
             printMidExposureIntegral += (enlargerIllum * trans) * prtSens[i]
         }
 
@@ -222,35 +228,33 @@ public final class MetalFilmRenderer {
             )
         }
 
-        // Step D: Equalize Equivalent Neutral Density (END) of Print C/M/Y Dyes!
-        // Because Cyan (width 52nm), Magenta (42nm), and Yellow (38nm) have different spectral widths,
-        // equal numerical density (1.0, 1.0, 1.0) would otherwise absorb more red than blue, tinting midtones cyan/blue!
-        // We iteratively balance the C/M/Y dye peak weights so that a neutral mid-density (0.8, 0.8, 0.8) integrates to exact D65 neutral gray chromaticity!
+        // Step D: Equalize Equivalent Neutral Density (END) of Print C/M/Y Dyes using explicit SIMD3<Float> & powf!
+        let zeroVec = SIMD3<Float>(0.0, 0.0, 0.0)
         var dyeScale = SIMD3<Float>(1.0, 1.0, 1.0)
         for _ in 0..<6 {
             var midXYZ = SIMD3<Float>(1e-6, 1e-6, 1e-6)
             for i in 0..<81 {
                 let lambda = Float(380 + i * 5)
                 let scannerIllum = blackbodyNormalized(lambdaNM: lambda, kelvin: 5500.0)
-                let dVec = max(prtDye[i], .zero) * dyeScale
-                let specD = 0.85 * (dVec.x + dVec.y + dVec.z)
-                let trans = pow(10.0, -specD)
+                let clampedDye = simd_max(prtDye[i], zeroVec)
+                let dVec: SIMD3<Float> = clampedDye * dyeScale
+                let specD: Float = 0.85 * (dVec.x + dVec.y + dVec.z)
+                let trans: Float = powf(10.0, -specD)
                 let cmf = SIMD3<Float>(ptrCMF[i].x, ptrCMF[i].y, ptrCMF[i].z)
                 midXYZ += (scannerIllum * trans) * cmf
             }
-            // Compare midXYZ against D65 white ratio (target 0.18 * d65White)
-            let targetXYZ = d65White * 0.22
-            let ratio = midXYZ / targetXYZ
-            // If X (Red) is too high, increase Cyan dye (dyeScale.x); if Y (Green) is too high, increase Magenta; if Z (Blue) is too high, increase Yellow
-            dyeScale.x *= pow(max(ratio.x, 0.2), 0.45)
-            dyeScale.y *= pow(max(ratio.y, 0.2), 0.45)
-            dyeScale.z *= pow(max(ratio.z, 0.2), 0.45)
+            let targetXYZ: SIMD3<Float> = d65White * 0.22
+            let ratio: SIMD3<Float> = midXYZ / targetXYZ
+            dyeScale.x *= powf(max(ratio.x, 0.2), 0.45)
+            dyeScale.y *= powf(max(ratio.y, 0.2), 0.45)
+            dyeScale.z *= powf(max(ratio.z, 0.2), 0.45)
         }
 
         for i in 0..<81 {
             let lambda = Float(380 + i * 5)
             let scannerIllum = blackbodyNormalized(lambdaNM: lambda, kelvin: 5500.0)
-            let balancedDye = max(prtDye[i], .zero) * dyeScale
+            let clampedDye = simd_max(prtDye[i], zeroVec)
+            let balancedDye: SIMD3<Float> = clampedDye * dyeScale
             ptrPrtDye[i] = SIMD4<Float>(balancedDye.x, balancedDye.y, balancedDye.z, scannerIllum)
         }
     }
@@ -269,21 +273,22 @@ public final class MetalFilmRenderer {
         let pixelSizeUm = (gateMM * 1000.0) / Float(max(imageWidth, 1))
         let umToPx = 1.0 / max(pixelSizeUm, 0.5)
 
-        let tempDelta = (params.devTemperatureCelsius - 37.8) * 0.04
-        let pushGammaFactor = pow(1.14, params.pushPullStops) * (1.0 + tempDelta) * params.agitationIntensity
-        let fogOffset = max(0.0, params.pushPullStops * 0.025 + tempDelta * 0.08)
+        let tempDelta: Float = (params.devTemperatureCelsius - 37.8) * 0.04
+        let pushGammaFactor: Float = powf(1.14, params.pushPullStops) * (1.0 + tempDelta) * params.agitationIntensity
+        let fogOffset: Float = max(0.0, params.pushPullStops * 0.025 + tempDelta * 0.08)
 
         let cpl = params.dirCouplerAmount
         let row0 = SIMD4<Float>(cpl, 0, 0, 0)
         let row1 = SIMD4<Float>(0, cpl, 0, 0)
         let row2 = SIMD4<Float>(0, 0, cpl, 0)
 
-        let effectiveHalationRGB = params.halationEnabled
+        let zeroVec3 = SIMD3<Float>(0.0, 0.0, 0.0)
+        let effectiveHalationRGB: SIMD3<Float> = params.halationEnabled
             ? (negStock.halationReflectanceRGB * (params.halationStrengthRGB / SIMD3<Float>(0.035, 0.006, 0.001)))
-            : .zero
+            : zeroVec3
         let halPxRGB = negStock.halationSigmaMicrometers * umToPx
 
-        let netPrintEV = params.autoPrintExposureComp
+        let netPrintEV: Float = params.autoPrintExposureComp
             ? (params.printExposureEV - params.exposureCompensationEV * 0.62)
             : params.printExposureEV
 
@@ -291,14 +296,14 @@ public final class MetalFilmRenderer {
         let totalMCC = params.dichroicMagentaCC
         let totalCCC = params.dichroicCyanCC
 
-        let preflashLin = (params.preflashExposureEV > -5.9) ? pow(2.0, params.preflashExposureEV) : 0.0
+        let preflashLin: Float = (params.preflashExposureEV > -5.9) ? powf(2.0, params.preflashExposureEV) : 0.0
         let callierQ: Float = (params.enlargerLightSource == .condenserPointSource) ? 1.15 : 1.0
 
         let modeFlag: Int32 = negStock.isReversal ? 1 : (negStock.isMonochrome ? 2 : 0)
         self.frameCounter &+= 1
 
         return MetalFilmUniforms(
-            exposureScale: pow(2.0, params.exposureCompensationEV),
+            exposureScale: powf(2.0, params.exposureCompensationEV),
             pushPullGammaScale: pushGammaFactor,
             dminFogOffset: fogOffset,
             opticalVignetteStrength: params.opticalVignettingStrength,
@@ -320,7 +325,7 @@ public final class MetalFilmRenderer {
             pixelSizeMicrometers: pixelSizeUm,
             frameSeed: frameCounter,
             dichroicFilterCMY: SIMD4<Float>(totalCCC, totalMCC, totalYCC, 0),
-            printExposureScale: pow(2.0, netPrintEV),
+            printExposureScale: powf(2.0, netPrintEV),
             printGamma: params.printGammaContrast,
             preflashLinearAddition: preflashLin,
             callierQFactor: callierQ,
