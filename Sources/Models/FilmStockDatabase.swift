@@ -18,7 +18,7 @@ public enum FilmProcessCategory: String, Codable, CaseIterable {
     case ra4AndCinePrint = "RA-4 Paper & Print Film"
 }
 
-/// Standardized Laboratory Datasheet Profile (Spectral 380-780nm @ 10nm bins = 41 bins, expandable to 81 bins @ 5nm)
+/// Standardized Laboratory Datasheet Profile (Spectral 380-780nm @ 5nm step = 81 bins)
 public struct FilmStockProfile: Codable, Identifiable, Equatable {
     public let id: String
     public let name: String
@@ -31,57 +31,52 @@ public struct FilmStockProfile: Codable, Identifiable, Equatable {
     public let isReversal: Bool
 
     // Hurter-Driffield (H-D) Sensitometric Curve Parameters per Layer (R, G, B)
-    public let dMinRGB: SIMD3<Float>          // Base + fog minimum density (includes orange mask on C-41/ECN-2)
-    public let dMaxRGB: SIMD3<Float>          // Maximum asymptotic dye density
-    public let gammaRGB: SIMD3<Float>         // Straight-line slope (contrast factor gamma)
-    public let shoulderSoftnessRGB: SIMD3<Float> // Highlight compression knee
-    public let toeSoftnessRGB: SIMD3<Float>   // Shadow threshold roll-off
+    public let dMinRGB: SIMD3<Float>
+    public let dMaxRGB: SIMD3<Float>
+    public let gammaRGB: SIMD3<Float>
+    public let shoulderSoftnessRGB: SIMD3<Float>
+    public let toeSoftnessRGB: SIMD3<Float>
 
     // Spectral Sensitivity Peak Centres (nm) & Bandwidths (nm) for Analytical 81-Band Reconstruction
-    // Reconstructs log10 S(lambda) across 380..780nm with secondary blue-absorption side-bands
-    public let peakWavelengthsNM: SIMD3<Float>    // [Red peak, Green peak, Blue peak]
-    public let spectralWidthsNM: SIMD3<Float>     // Gaussian/Super-Gaussian half-widths
-    public let crossTalkBlueToRedGreen: SIMD2<Float> // Intrinsic blue sensitivity of red/green halide layers
+    public let peakWavelengthsNM: SIMD3<Float>
+    public let spectralWidthsNM: SIMD3<Float>
+    public let crossTalkBlueToRedGreen: SIMD2<Float>
 
     // Normalized Dye Spectral Absorption Peaks & Side-Absorption (Unmixed + Masking Couplers)
-    public let dyePeakWavelengthsNM: SIMD3<Float> // [Cyan ~650-670nm, Magenta ~540-555nm, Yellow ~440-450nm]
+    public let dyePeakWavelengthsNM: SIMD3<Float>
     public let dyeWidthsNM: SIMD3<Float>
-    public let maskingCouplerNegativeAbsorption: SIMD3<Float> // Negative secondary absorption from orange/pink masking couplers
+    public let maskingCouplerNegativeAbsorption: SIMD3<Float>
 
     // Micro-Structure, Grain & Optical Scatter
-    public let rmsGranularity: Float          // Diffuse RMS Granularity (x1000, e.g., Portra 400 = 11.0, Velvia 50 = 9.0)
-    public let mtf50CyclesPerMM: Float        // Frieser MTF 50% response frequency (cycles/mm)
-    public let halationReflectanceRGB: SIMD3<Float> // Base-interface back-reflection fraction
-    public let halationSigmaMicrometers: SIMD3<Float> // Physical scatter radius in micrometers
-    public let dirInterlayerMatrix: [Float]   // 3x3 DIR coupler inhibition matrix (flattened row-major)
-    public let defaultEnlargerYMShift: SIMD2<Float> // Neutral 18% gray calibration shift (Yellow, Magenta CC)
+    public let rmsGranularity: Float
+    public let mtf50CyclesPerMM: Float
+    public let halationReflectanceRGB: SIMD3<Float>
+    public let halationSigmaMicrometers: SIMD3<Float>
+    public let dirInterlayerMatrix: [Float]
+    public let defaultEnlargerYMShift: SIMD2<Float>
 
     /// Generates the 81-wavelength (380nm to 780nm, 5nm step) spectral sensitivity array S_R(λ), S_G(λ), S_B(λ)
     public func evaluateSpectralSensitivities81() -> [SIMD3<Float>] {
-        var table = [SIMD3<Float>](repeating: .zero, count: 81)
+        var table = [SIMD3<Float>](repeating: SIMD3<Float>(0, 0, 0), count: 81)
         for i in 0..<81 {
             let lambda = Float(380 + i * 5)
-            // Primary Gaussian + asymmetric long-wave tail model fitted to manufacturer log-sensitivity curves
-            let dR = (lambda - peakWavelengthsNM.x) / spectralWidthsNM.x
-            let dG = (lambda - peakWavelengthsNM.y) / spectralWidthsNM.y
-            let dB = (lambda - peakWavelengthsNM.z) / spectralWidthsNM.z
+            let dR: Float = (lambda - peakWavelengthsNM.x) / spectralWidthsNM.x
+            let dG: Float = (lambda - peakWavelengthsNM.y) / spectralWidthsNM.y
+            let dB: Float = (lambda - peakWavelengthsNM.z) / spectralWidthsNM.z
 
-            let sB = exp(-0.5 * dB * dB)
-            // Yellow Careylea silver filter cuts blue light above 500nm from reaching G and R layers,
-            // leaving only residual blue cross-talk below 460nm
-            let blueLeak = exp(-0.5 * pow((lambda - 425.0) / 28.0, 2.0))
-            let sG = exp(-0.5 * dG * dG) + crossTalkBlueToRedGreen.y * blueLeak
-            let sR = exp(-0.5 * dR * dR) + crossTalkBlueToRedGreen.x * blueLeak
+            let sB: Float = expf(-0.5 * dB * dB)
+            let bDiff: Float = (lambda - 425.0) / 28.0
+            let blueLeak: Float = expf(-0.5 * bDiff * bDiff)
+            let sG: Float = expf(-0.5 * dG * dG) + crossTalkBlueToRedGreen.y * blueLeak
+            let sR: Float = expf(-0.5 * dR * dR) + crossTalkBlueToRedGreen.x * blueLeak
 
             if isMonochrome {
-                // Panchromatic B&W sensitivity (extended red or orthopan response)
-                let pan = 0.38 * sB + 0.42 * sG + 0.35 * sR
+                let pan: Float = 0.38 * sB + 0.42 * sG + 0.35 * sR
                 table[i] = SIMD3<Float>(pan, pan, pan)
             } else {
                 table[i] = SIMD3<Float>(max(sR, 1e-6), max(sG, 1e-6), max(sB, 1e-6))
             }
         }
-        // Normalize integrals to unity under reference illuminant
         var sum = SIMD3<Float>(1e-6, 1e-6, 1e-6)
         for v in table { sum += v }
         return table.map { $0 / sum }
@@ -89,26 +84,29 @@ public struct FilmStockProfile: Codable, Identifiable, Equatable {
 
     /// Generates the 81-wavelength (380nm to 780nm, 5nm step) unit dye spectral density curves d_C(λ), d_M(λ), d_Y(λ)
     public func evaluateDyeSpectralDensities81() -> [SIMD3<Float>] {
-        var table = [SIMD3<Float>](repeating: .zero, count: 81)
+        var table = [SIMD3<Float>](repeating: SIMD3<Float>(0, 0, 0), count: 81)
         for i in 0..<81 {
             let lambda = Float(380 + i * 5)
             if isMonochrome {
-                // Developed metallic silver shows nearly flat neutral spectral density with slight UV/blue rise
-                let agDensity = 1.0 + 0.08 * exp(-0.5 * pow((lambda - 400.0) / 60.0, 2.0))
+                let uvDiff: Float = (lambda - 400.0) / 60.0
+                let agDensity: Float = 1.0 + 0.08 * expf(-0.5 * uvDiff * uvDiff)
                 table[i] = SIMD3<Float>(agDensity, agDensity, agDensity)
             } else {
-                let dC = (lambda - dyePeakWavelengthsNM.x) / dyeWidthsNM.x
-                let dM = (lambda - dyePeakWavelengthsNM.y) / dyeWidthsNM.y
-                let dY = (lambda - dyePeakWavelengthsNM.z) / dyeWidthsNM.z
+                let dC: Float = (lambda - dyePeakWavelengthsNM.x) / dyeWidthsNM.x
+                let dM: Float = (lambda - dyePeakWavelengthsNM.y) / dyeWidthsNM.y
+                let dY: Float = (lambda - dyePeakWavelengthsNM.z) / dyeWidthsNM.z
 
-                // Main absorption lobes + secondary unwanted absorptions compensated by colored masking couplers
-                let cyanMain = exp(-0.5 * dC * dC)
-                let magentaMain = exp(-0.5 * dM * dM)
-                let yellowMain = exp(-0.5 * dY * dY)
+                let cyanMain: Float = expf(-0.5 * dC * dC)
+                let magentaMain: Float = expf(-0.5 * dM * dM)
+                let yellowMain: Float = expf(-0.5 * dY * dY)
 
-                let cyanSide = (0.14 - maskingCouplerNegativeAbsorption.x) * exp(-0.5 * pow((lambda - 450.0) / 45.0, 2.0))
-                let magentaSide = (0.18 - maskingCouplerNegativeAbsorption.y) * exp(-0.5 * pow((lambda - 435.0) / 38.0, 2.0))
-                let yellowSide = (0.05 - maskingCouplerNegativeAbsorption.z) * exp(-0.5 * pow((lambda - 520.0) / 40.0, 2.0))
+                let cSideDiff: Float = (lambda - 450.0) / 45.0
+                let mSideDiff: Float = (lambda - 435.0) / 38.0
+                let ySideDiff: Float = (lambda - 520.0) / 40.0
+
+                let cyanSide: Float = (0.14 - maskingCouplerNegativeAbsorption.x) * expf(-0.5 * cSideDiff * cSideDiff)
+                let magentaSide: Float = (0.18 - maskingCouplerNegativeAbsorption.y) * expf(-0.5 * mSideDiff * mSideDiff)
+                let yellowSide: Float = (0.05 - maskingCouplerNegativeAbsorption.z) * expf(-0.5 * ySideDiff * ySideDiff)
 
                 table[i] = SIMD3<Float>(
                     max(cyanMain + cyanSide, -0.12),
@@ -122,9 +120,7 @@ public struct FilmStockProfile: Codable, Identifiable, Equatable {
 }
 
 public enum FilmStockDatabase {
-    // MARK: - Complete 22 Camera Negative / Slide / B&W Stocks
     public static let cameraStocks: [FilmStockProfile] = [
-        // 1. C-41 Color Negative Films (8 Stocks)
         FilmStockProfile(
             id: "kodak_portra_160",
             name: "Kodak Portra 160",
@@ -332,7 +328,6 @@ public enum FilmStockDatabase {
             gammaRGB: SIMD3<Float>(0.59, 0.63, 0.64),
             shoulderSoftnessRGB: SIMD3<Float>(0.44, 0.41, 0.39),
             toeSoftnessRGB: SIMD3<Float>(0.29, 0.27, 0.26),
-            // 4th Color Layer (Cyan-sensitive ~505nm effect modelled via narrowed green-blue separation)
             peakWavelengthsNM: SIMD3<Float>(638, 540, 446),
             spectralWidthsNM: SIMD3<Float>(33, 28, 28),
             crossTalkBlueToRedGreen: SIMD2<Float>(0.02, 0.03),
@@ -382,8 +377,6 @@ public enum FilmStockDatabase {
             ],
             defaultEnlargerYMShift: SIMD2<Float>(-1.0, -3.0)
         ),
-
-        // 2. ECN-2 Motion Picture Negative & Remjet-Removed CineStill Stocks (6 Stocks)
         FilmStockProfile(
             id: "kodak_vision3_50d_5203",
             name: "Kodak Vision3 50D (5203)",
@@ -407,7 +400,7 @@ public enum FilmStockDatabase {
             maskingCouplerNegativeAbsorption: SIMD3<Float>(0.12, 0.15, 0.03),
             rmsGranularity: 6.5,
             mtf50CyclesPerMM: 82.0,
-            halationReflectanceRGB: SIMD3<Float>(0.005, 0.002, 0.001), // Remjet carbon backing absorbs reflection
+            halationReflectanceRGB: SIMD3<Float>(0.005, 0.002, 0.001),
             halationSigmaMicrometers: SIMD3<Float>(110, 60, 30),
             dirInterlayerMatrix: [
                  0.90, -0.18, -0.06,
@@ -522,7 +515,6 @@ public enum FilmStockDatabase {
             hasAntiHalationRemjet: false,
             isMonochrome: false,
             isReversal: false,
-            // 5219 cross-processed in C-41: steeper gamma + higher Dmax + intense red-orange halation
             dMinRGB: SIMD3<Float>(0.23, 0.62, 0.94),
             dMaxRGB: SIMD3<Float>(2.28, 2.66, 2.98),
             gammaRGB: SIMD3<Float>(0.63, 0.65, 0.67),
@@ -536,7 +528,6 @@ public enum FilmStockDatabase {
             maskingCouplerNegativeAbsorption: SIMD3<Float>(0.11, 0.14, 0.03),
             rmsGranularity: 12.8,
             mtf50CyclesPerMM: 60.0,
-            // Intense red-orange halation due to missing Remjet backing
             halationReflectanceRGB: SIMD3<Float>(0.095, 0.024, 0.003),
             halationSigmaMicrometers: SIMD3<Float>(285, 135, 55),
             dirInterlayerMatrix: [
@@ -578,8 +569,6 @@ public enum FilmStockDatabase {
             ],
             defaultEnlargerYMShift: SIMD2<Float>(-2.0, 3.0)
         ),
-
-        // 3. E-6 & K-14 Color Reversal / Slide Films (5 Stocks)
         FilmStockProfile(
             id: "fujifilm_velvia_50",
             name: "Fujifilm Velvia 50 (RVP50)",
@@ -718,7 +707,6 @@ public enum FilmStockDatabase {
             hasAntiHalationRemjet: true,
             isMonochrome: false,
             isReversal: true,
-            // K-14 External Dye Couplers in Developer: ultra-narrow dye bandwidths, deep Dmax, rich red/cyan separation
             dMinRGB: SIMD3<Float>(0.08, 0.09, 0.11),
             dMaxRGB: SIMD3<Float>(3.75, 3.82, 3.65),
             gammaRGB: SIMD3<Float>(1.78, 1.82, 1.75),
@@ -731,7 +719,7 @@ public enum FilmStockDatabase {
             dyeWidthsNM: SIMD3<Float>(42, 35, 31),
             maskingCouplerNegativeAbsorption: SIMD3<Float>(0.0, 0.0, 0.0),
             rmsGranularity: 10.0,
-            mtf50CyclesPerMM: 92.0, // No oil-dispersed couplers in emulsion -> ultra-high acutance
+            mtf50CyclesPerMM: 92.0,
             halationReflectanceRGB: SIMD3<Float>(0.008, 0.002, 0.001),
             halationSigmaMicrometers: SIMD3<Float>(115, 58, 28),
             dirInterlayerMatrix: [
@@ -741,8 +729,6 @@ public enum FilmStockDatabase {
             ],
             defaultEnlargerYMShift: SIMD2<Float>(0.0, 0.0)
         ),
-
-        // 4. Classic Black & White Silver Gelatin Negatives (4 Stocks)
         FilmStockProfile(
             id: "ilford_hp5_plus_400",
             name: "Ilford HP5 Plus 400",
@@ -763,7 +749,7 @@ public enum FilmStockDatabase {
             crossTalkBlueToRedGreen: SIMD2<Float>(0.05, 0.05),
             dyePeakWavelengthsNM: SIMD3<Float>(550, 550, 550),
             dyeWidthsNM: SIMD3<Float>(200, 200, 200),
-            maskingCouplerNegativeAbsorption: .zero,
+            maskingCouplerNegativeAbsorption: SIMD3<Float>(0, 0, 0),
             rmsGranularity: 14.5,
             mtf50CyclesPerMM: 54.0,
             halationReflectanceRGB: SIMD3<Float>(0.030, 0.030, 0.030),
@@ -795,7 +781,7 @@ public enum FilmStockDatabase {
             crossTalkBlueToRedGreen: SIMD2<Float>(0.06, 0.06),
             dyePeakWavelengthsNM: SIMD3<Float>(550, 550, 550),
             dyeWidthsNM: SIMD3<Float>(200, 200, 200),
-            maskingCouplerNegativeAbsorption: .zero,
+            maskingCouplerNegativeAbsorption: SIMD3<Float>(0, 0, 0),
             rmsGranularity: 24.0,
             mtf50CyclesPerMM: 42.0,
             halationReflectanceRGB: SIMD3<Float>(0.042, 0.042, 0.042),
@@ -827,7 +813,7 @@ public enum FilmStockDatabase {
             crossTalkBlueToRedGreen: SIMD2<Float>(0.05, 0.05),
             dyePeakWavelengthsNM: SIMD3<Float>(550, 550, 550),
             dyeWidthsNM: SIMD3<Float>(200, 200, 200),
-            maskingCouplerNegativeAbsorption: .zero,
+            maskingCouplerNegativeAbsorption: SIMD3<Float>(0, 0, 0),
             rmsGranularity: 16.0,
             mtf50CyclesPerMM: 56.0,
             halationReflectanceRGB: SIMD3<Float>(0.032, 0.032, 0.032),
@@ -859,7 +845,7 @@ public enum FilmStockDatabase {
             crossTalkBlueToRedGreen: SIMD2<Float>(0.05, 0.05),
             dyePeakWavelengthsNM: SIMD3<Float>(550, 550, 550),
             dyeWidthsNM: SIMD3<Float>(200, 200, 200),
-            maskingCouplerNegativeAbsorption: .zero,
+            maskingCouplerNegativeAbsorption: SIMD3<Float>(0, 0, 0),
             rmsGranularity: 14.0,
             mtf50CyclesPerMM: 60.0,
             halationReflectanceRGB: SIMD3<Float>(0.036, 0.036, 0.036),
@@ -873,7 +859,6 @@ public enum FilmStockDatabase {
         )
     ]
 
-    // MARK: - Complete 5 Darkroom Print Papers & Motion Picture Print Stocks
     public static let printStocks: [FilmStockProfile] = [
         FilmStockProfile(
             id: "kodak_endura_premier",
@@ -895,13 +880,13 @@ public enum FilmStockDatabase {
             crossTalkBlueToRedGreen: SIMD2<Float>(0.005, 0.008),
             dyePeakWavelengthsNM: SIMD3<Float>(655, 542, 444),
             dyeWidthsNM: SIMD3<Float>(52, 42, 38),
-            maskingCouplerNegativeAbsorption: .zero,
+            maskingCouplerNegativeAbsorption: SIMD3<Float>(0, 0, 0),
             rmsGranularity: 4.0,
             mtf50CyclesPerMM: 85.0,
-            halationReflectanceRGB: .zero,
+            halationReflectanceRGB: SIMD3<Float>(0, 0, 0),
             halationSigmaMicrometers: SIMD3<Float>(20, 20, 20),
             dirInterlayerMatrix: [1,0,0, 0,1,0, 0,0,1],
-            defaultEnlargerYMShift: .zero
+            defaultEnlargerYMShift: SIMD2<Float>(0, 0)
         ),
         FilmStockProfile(
             id: "fujifilm_crystal_archive_typeii",
@@ -923,13 +908,13 @@ public enum FilmStockDatabase {
             crossTalkBlueToRedGreen: SIMD2<Float>(0.004, 0.007),
             dyePeakWavelengthsNM: SIMD3<Float>(652, 544, 446),
             dyeWidthsNM: SIMD3<Float>(50, 41, 37),
-            maskingCouplerNegativeAbsorption: .zero,
+            maskingCouplerNegativeAbsorption: SIMD3<Float>(0, 0, 0),
             rmsGranularity: 3.8,
             mtf50CyclesPerMM: 88.0,
-            halationReflectanceRGB: .zero,
+            halationReflectanceRGB: SIMD3<Float>(0, 0, 0),
             halationSigmaMicrometers: SIMD3<Float>(18, 18, 18),
             dirInterlayerMatrix: [1,0,0, 0,1,0, 0,0,1],
-            defaultEnlargerYMShift: .zero
+            defaultEnlargerYMShift: SIMD2<Float>(0, 0)
         ),
         FilmStockProfile(
             id: "kodak_vision_2383",
@@ -941,7 +926,6 @@ public enum FilmStockDatabase {
             hasAntiHalationRemjet: true,
             isMonochrome: false,
             isReversal: false,
-            // Iconic cinema print film: deep rich blacks (Dmax ~3.6), cyan-blue shadow shift, golden warmth in midtones
             dMinRGB: SIMD3<Float>(0.06, 0.07, 0.09),
             dMaxRGB: SIMD3<Float>(3.55, 3.62, 3.48),
             gammaRGB: SIMD3<Float>(2.85, 2.92, 2.80),
@@ -952,10 +936,10 @@ public enum FilmStockDatabase {
             crossTalkBlueToRedGreen: SIMD2<Float>(0.004, 0.006),
             dyePeakWavelengthsNM: SIMD3<Float>(668, 545, 442),
             dyeWidthsNM: SIMD3<Float>(48, 39, 35),
-            maskingCouplerNegativeAbsorption: .zero,
+            maskingCouplerNegativeAbsorption: SIMD3<Float>(0, 0, 0),
             rmsGranularity: 5.0,
             mtf50CyclesPerMM: 95.0,
-            halationReflectanceRGB: .zero,
+            halationReflectanceRGB: SIMD3<Float>(0, 0, 0),
             halationSigmaMicrometers: SIMD3<Float>(15, 15, 15),
             dirInterlayerMatrix: [1,0,0, 0,1,0, 0,0,1],
             defaultEnlargerYMShift: SIMD2<Float>(-2.0, 2.0)
@@ -970,7 +954,6 @@ public enum FilmStockDatabase {
             hasAntiHalationRemjet: true,
             isMonochrome: false,
             isReversal: false,
-            // Softer toe and more neutral-warm shadows compared to 2383
             dMinRGB: SIMD3<Float>(0.06, 0.07, 0.08),
             dMaxRGB: SIMD3<Float>(3.42, 3.48, 3.40),
             gammaRGB: SIMD3<Float>(2.72, 2.76, 2.70),
@@ -981,10 +964,10 @@ public enum FilmStockDatabase {
             crossTalkBlueToRedGreen: SIMD2<Float>(0.004, 0.006),
             dyePeakWavelengthsNM: SIMD3<Float>(662, 544, 445),
             dyeWidthsNM: SIMD3<Float>(49, 40, 36),
-            maskingCouplerNegativeAbsorption: .zero,
+            maskingCouplerNegativeAbsorption: SIMD3<Float>(0, 0, 0),
             rmsGranularity: 4.8,
             mtf50CyclesPerMM: 94.0,
-            halationReflectanceRGB: .zero,
+            halationReflectanceRGB: SIMD3<Float>(0, 0, 0),
             halationSigmaMicrometers: SIMD3<Float>(15, 15, 15),
             dirInterlayerMatrix: [1,0,0, 0,1,0, 0,0,1],
             defaultEnlargerYMShift: SIMD2<Float>(-1.0, 0.0)
@@ -999,7 +982,6 @@ public enum FilmStockDatabase {
             hasAntiHalationRemjet: false,
             isMonochrome: true,
             isReversal: false,
-            // Variable-contrast B&W fiber-base paper (supports grades 00 to 5 via blue/green sensitizer balance)
             dMinRGB: SIMD3<Float>(0.05, 0.05, 0.06),
             dMaxRGB: SIMD3<Float>(2.28, 2.28, 2.25),
             gammaRGB: SIMD3<Float>(2.15, 2.15, 2.15),
@@ -1010,21 +992,21 @@ public enum FilmStockDatabase {
             crossTalkBlueToRedGreen: SIMD2<Float>(0.02, 0.02),
             dyePeakWavelengthsNM: SIMD3<Float>(550, 550, 550),
             dyeWidthsNM: SIMD3<Float>(200, 200, 200),
-            maskingCouplerNegativeAbsorption: .zero,
+            maskingCouplerNegativeAbsorption: SIMD3<Float>(0, 0, 0),
             rmsGranularity: 3.5,
             mtf50CyclesPerMM: 90.0,
-            halationReflectanceRGB: .zero,
+            halationReflectanceRGB: SIMD3<Float>(0, 0, 0),
             halationSigmaMicrometers: SIMD3<Float>(16, 16, 16),
             dirInterlayerMatrix: [1,0,0, 0,1,0, 0,0,1],
-            defaultEnlargerYMShift: .zero
+            defaultEnlargerYMShift: SIMD2<Float>(0, 0)
         )
     ]
 
     public static func cameraStock(withID id: String) -> FilmStockProfile {
-        cameraStocks.first(where: { $0.id == id }) ?? cameraStocks[1] // Default Portra 400
+        cameraStocks.first(where: { $0.id == id }) ?? cameraStocks[1]
     }
 
     public static func printStock(withID id: String) -> FilmStockProfile {
-        printStocks.first(where: { $0.id == id }) ?? printStocks[0] // Default Endura Premier
+        printStocks.first(where: { $0.id == id }) ?? printStocks[0]
     }
 }
