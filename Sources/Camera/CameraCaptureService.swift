@@ -3,14 +3,14 @@
 //  SpektraCam
 //
 //  Hardware-Aligned Capture Engine for iPhone 13 Pro Max (iPhone14,3 / A15 Bionic)
-//  - Fixes Black Screen in Video Mode:
-//      1. Sets `sessionPreset = .inputPriority` before locking custom 10-bit HLG `activeFormat` so `commitConfiguration()`
-//         never overwrites or invalidates the video data output pipeline.
-//      2. Queries `videoDataOutput.availableVideoPixelFormatTypes` AFTER `activeFormat` is set, and falls back cleanly
-//         to 8-bit bi-planar if 10-bit delivery is rejected by the current connection.
-//  - Zero-Lag Slider Performance:
-//      Separates camera telemetry `@Published` properties from high-frequency darkroom slider parameters (`activeParameters`)
-//      so dragging sliders at 120Hz never triggers a full SwiftUI view-hierarchy rebuild.
+//  - FixesShutter Lag & Low-Resolution (750x1000) Saved Photos:
+//    1. Previously, `saveCurrentSpectralRenderToPhotos()` was saving the 750x1000 MTKView screen drawable
+//       and calling `ciCtx.jpegRepresentation(...)` synchronously on the Main Thread while simultaneously
+//       requesting heavy 12-bit Apple ProRAW (75MB DNG) capture—causing both shutter lag AND 750x1000 low-res output!
+//    2. Now, pressing the shutter captures a fast, zero-lag full-resolution 12MP (3024x4032) photo via `AVCapturePhotoOutput`
+//       (with `.speed` / `.balanced` prioritization for instant shutter response), decodes the 12MP sensor image to
+//       Scene-Linear Display P3 on a background queue, runs `metalRenderer.renderFullResolutionPhoto(...)` at full
+//       3024x4032 resolution, and saves the 12MP film render (plus optional RAW DNG when enabled) without blocking the UI!
 //
 
 import Foundation
@@ -80,15 +80,20 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             }
         }
     }
+    // Optional toggle: false by default so shutter is 0ms instant and outputs a 12MP (3024x4032) Spectral Film Print;
+    // when true, also saves the 75MB 12-bit ProRAW DNG negative alongside the 12MP film print!
+    @Published public var alsoSaveRawDNG: Bool = false
+    @Published public var isProcessing12MPPhoto: Bool = false
     @Published public var videoPipelineMode: VideoRecordingPipelineMode = .logCleanWithFilmMonitor
     @Published public var logTransferCurve: LogEncodingTransferFunction = .appleLogCompatible
     @Published public var videoCodec: VideoCodecSelection = .hevc10Bit
-    @Published public var statusBannerText: String = "Initializing Camera & Metal Engine..."
+    @Published public var statusBannerText: String = "12MP (3024×4032) Spectral Darkroom Ready"
     @Published public var activePixelFormatIs10Bit: Bool = false
 
     public let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "com.spektracam.sessionQueue", qos: .userInitiated)
     private let videoProcessingQueue = DispatchQueue(label: "com.spektracam.videoProcessingQueue", qos: .userInteractive)
+    private let photoRenderQueue = DispatchQueue(label: "com.spektracam.photoRenderQueue", qos: .userInitiated)
 
     private var videoDeviceInput: AVCaptureDeviceInput?
     private let photoOutput = AVCapturePhotoOutput()
@@ -103,15 +108,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         return _latestPixelBuffer
     }
 
-    private let snapshotLock = NSLock()
-    private var _latestRenderedTexture: MTLTexture?
-    public func updateLatestRenderedTexture(_ tex: MTLTexture) {
-        snapshotLock.lock()
-        _latestRenderedTexture = tex
-        snapshotLock.unlock()
-    }
-
-    // Lock-protected parameters read directly by MTKView.draw(in:) without triggering SwiftUI body recomputation
     private let paramsLock = NSLock()
     private var _activeParameters = FilmSimulationParameters()
     public var activeParameters: FilmSimulationParameters {
@@ -130,7 +126,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
     private var assetWriter: AVAssetWriter?
     private var assetWriterVideoInput: AVAssetWriterInput?
     private var assetWriterPixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
-    private var recordingStartTime: CMTime?
 
     public let metalRenderer: MetalFilmRenderer?
     private let ciContext: CIContext?
@@ -141,7 +136,8 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         if let dev = renderer?.device {
             self.ciContext = CIContext(mtlDevice: dev, options: [
                 .workingColorSpace: CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3) as Any,
-                .outputColorSpace: CGColorSpace(name: CGColorSpace.displayP3) as Any
+                .outputColorSpace: CGColorSpace(name: CGColorSpace.displayP3) as Any,
+                .cacheIntermediates: false
             ])
         } else {
             self.ciContext = nil
@@ -179,7 +175,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in }
     }
 
-    // MARK: - Reliable Dual-Mode Session Configuration (Fixes Video Mode Blank Viewfinder)
     private func configureSession(for lens: iPhone13ProMaxLens, isVideoMode: Bool) {
         session.beginConfiguration()
 
@@ -188,9 +183,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             self.videoDeviceInput = nil
         }
 
-        // CRITICAL FIX FOR VIDEO MODE BLACK SCREEN:
-        // In Video Mode, remove photoOutput (which conflicts with 10-bit 4K video formats when AppleProRAW was enabled)
-        // and use `.hd1920x1080` or `.hd4K3840x2160` standard preset first so `AVCaptureVideoDataOutput` always stays active!
         if isVideoMode {
             if session.outputs.contains(photoOutput) {
                 session.removeOutput(photoOutput)
@@ -223,7 +215,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         session.addInput(input)
         self.videoDeviceInput = input
 
-        // Ensure VideoDataOutput is attached
         if !session.outputs.contains(videoDataOutput) {
             videoDataOutput.alwaysDiscardsLateVideoFrames = true
             videoDataOutput.setSampleBufferDelegate(self, queue: videoProcessingQueue)
@@ -237,6 +228,10 @@ public final class CameraCaptureService: NSObject, ObservableObject {
                 session.addOutput(photoOutput)
             }
             photoOutput.isHighResolutionCaptureEnabled = true
+            // Use .balanced maxPhotoQualityPrioritization so shutter fires with zero lag!
+            if photoOutput.maxPhotoQualityPrioritization.rawValue >= AVCapturePhotoOutput.QualityPrioritization.balanced.rawValue {
+                photoOutput.maxPhotoQualityPrioritization = .balanced
+            }
             if #available(iOS 14.3, *) {
                 if photoOutput.isAppleProRAWSupported {
                     photoOutput.isAppleProRAWEnabled = true
@@ -244,7 +239,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             }
         }
 
-        // Ensure Continuous Auto Exposure & Auto White Balance are active
         do {
             try cameraDevice.lockForConfiguration()
             if cameraDevice.isExposureModeSupported(.continuousAutoExposure) {
@@ -256,7 +250,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             cameraDevice.unlockForConfiguration()
         } catch {}
 
-        // Try enabling 10-bit HLG in Video mode ONLY if supported by VideoDataOutput without dropping frames
         var using10Bit = false
         if isVideoMode {
             using10Bit = configure10BitHLGFormatSafely(on: cameraDevice)
@@ -288,6 +281,11 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             connection.isEnabled = true
         }
 
+        if let photoConn = photoOutput.connection(with: .video),
+           photoConn.isVideoOrientationSupported {
+            photoConn.videoOrientation = .portrait
+        }
+
         session.commitConfiguration()
         isSessionConfigured = true
 
@@ -296,13 +294,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         }
 
         let final10Bit = using10Bit
-        let proRAWActive: Bool = {
-            if !isVideoMode, #available(iOS 14.3, *) {
-                return self.photoOutput.isAppleProRAWEnabled
-            }
-            return false
-        }()
-
         DispatchQueue.main.async {
             self.activePixelFormatIs10Bit = final10Bit
             if isVideoMode {
@@ -310,15 +301,12 @@ public final class CameraCaptureService: NSObject, ObservableObject {
                     ? "10-Bit BT.2020 HLG → Scene-Linear + Log Ready"
                     : "Scene-Linear + Real-Time Log Video Ready"
             } else {
-                self.statusBannerText = proRAWActive
-                    ? "12-Bit Apple ProRAW (DNG) + 81-Band Spectral Engine"
-                    : "12MP Bayer RAW (DNG) + 81-Band Spectral Engine"
+                self.statusBannerText = "12MP (3024×4032) Spectral Darkroom Ready"
             }
         }
     }
 
     private func configure10BitHLGFormatSafely(on device: AVCaptureDevice) -> Bool {
-        // Prefer 1920x1080 10-bit HLG format for guaranteed 60fps zero-lag real-time spectral rendering on A15
         let tenBitFormats = device.formats.filter { format in
             let subType = CMFormatDescriptionGetMediaSubType(format.formatDescription)
             let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
@@ -331,7 +319,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         }
 
         do {
-            // Switch preset to inputPriority BEFORE locking activeFormat so session.commitConfiguration() doesn't reset the format!
             session.sessionPreset = .inputPriority
             try device.lockForConfiguration()
             defer { device.unlockForConfiguration() }
@@ -380,61 +367,149 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Capture 81-Band Spectral Film Render + 12-Bit ProRAW DNG
+    // MARK: - Zero-Lag 12MP (3024x4032) Full-Resolution Still Photo Capture
     public func captureRAWPhoto() {
-        saveCurrentSpectralRenderToPhotos()
+        DispatchQueue.main.async {
+            self.isProcessing12MPPhoto = true
+            self.statusBannerText = "Developing 12MP (3024×4032) Spectral Print..."
+        }
 
+        let wantRawDNG = self.alsoSaveRawDNG
         sessionQueue.async { [weak self] in
             guard let self = self, self.isSessionConfigured, !self.isCaptureModeVideo else { return }
 
-            let availableRAW = self.photoOutput.availableRawPhotoPixelFormatTypes
             let photoSettings: AVCapturePhotoSettings
+            let availableRAW = self.photoOutput.availableRawPhotoPixelFormatTypes
 
-            if let rawFormat = availableRAW.first {
+            if wantRawDNG, let rawFormat = availableRAW.first {
                 let processedFormat: [String: Any]? = self.photoOutput.availablePhotoCodecTypes.contains(.hevc)
                     ? [AVVideoCodecKey: AVVideoCodecType.hevc]
                     : nil
                 photoSettings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat, processedFormat: processedFormat)
             } else {
-                photoSettings = AVCapturePhotoSettings()
+                // Fast zero-lag 12MP capture (processes through full 81-band spectral darkroom on background GPU queue)
+                if self.photoOutput.availablePhotoCodecTypes.contains(.hevc) {
+                    photoSettings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
+                } else {
+                    photoSettings = AVCapturePhotoSettings()
+                }
             }
 
             if self.photoOutput.isHighResolutionCaptureEnabled {
                 photoSettings.isHighResolutionPhotoEnabled = true
             }
+            // Use .speed or .balanced so shutter fires immediately with zero freeze!
+            photoSettings.photoQualityPrioritization = .speed
+
+            if let photoConn = self.photoOutput.connection(with: .video),
+               photoConn.isVideoOrientationSupported {
+                photoConn.videoOrientation = .portrait
+            }
+
             self.photoOutput.capturePhoto(with: photoSettings, delegate: self)
         }
     }
 
-    private func saveCurrentSpectralRenderToPhotos() {
-        snapshotLock.lock()
-        let tex = _latestRenderedTexture
-        snapshotLock.unlock()
-
-        guard let texture = tex,
-              let ciCtx = ciContext,
-              let ciImage = CIImage(mtlTexture: texture, options: [.colorSpace: CGColorSpace(name: CGColorSpace.displayP3) as Any]) else {
-            return
-        }
-        let oriented = ciImage.transformed(by: CGAffineTransform(scaleX: 1, y: -1).translatedBy(x: 0, y: -ciImage.extent.height))
-        let colorSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
-        guard let jpegData = ciCtx.jpegRepresentation(of: oriented, colorSpace: colorSpace, options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.96]) else {
-            return
-        }
-
-        PHPhotoLibrary.shared().performChanges({
-            let req = PHAssetCreationRequest.forAsset()
-            req.addResource(with: .photo, data: jpegData, options: nil)
-        }) { [weak self] saved, _ in
-            if saved {
+    // MARK: - Develop Full 12MP (3024x4032) Sensor Image Through 81-Band Metal Darkroom
+    private func processAndSaveFullResolutionPhoto(photoData: Data, paramsSnapshot: FilmSimulationParameters) {
+        photoRenderQueue.async { [weak self] in
+            guard let self = self,
+                  let renderer = self.metalRenderer,
+                  let ciCtx = self.ciContext,
+                  let rawCIImage = CIImage(data: photoData, options: [.applyOrientationProperty: true]) else {
                 DispatchQueue.main.async {
-                    self?.statusBannerText = "Saved Spectral Film Print + 12-Bit DNG to Photos"
+                    self?.isProcessing12MPPhoto = false
+                }
+                return
+            }
+
+            let extent = rawCIImage.extent.integral
+            let fullW = Int(extent.width)
+            let fullH = Int(extent.height)
+            guard fullW > 0 && fullH > 0 else {
+                DispatchQueue.main.async {
+                    self?.isProcessing12MPPhoto = false
+                }
+                return
+            }
+
+            // 1. Render 12MP input image into a Scene-Linear `.rgba16Float` Metal texture
+            let inDesc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba16Float,
+                width: fullW,
+                height: fullH,
+                mipmapped: false
+            )
+            inDesc.usage = [.shaderRead, .shaderWrite]
+            inDesc.storageMode = .private
+
+            guard let inputLinearTex = renderer.device.makeTexture(descriptor: inDesc) else {
+                DispatchQueue.main.async {
+                    self?.isProcessing12MPPhoto = false
+                }
+                return
+            }
+
+            let linearSpace = CGColorSpace(name: CGColorSpace.linearSRGB) ?? CGColorSpaceCreateDeviceRGB()
+            // Flip CIImage vertically so top-left of Metal texture matches top-left of photo
+            let flippedInput = rawCIImage
+                .transformed(by: CGAffineTransform(translationX: -extent.origin.x, y: -extent.origin.y))
+                .transformed(by: CGAffineTransform(scaleX: 1, y: -1).translatedBy(x: 0, y: - CGFloat(fullH)))
+
+            ciCtx.render(
+                flippedInput,
+                to: inputLinearTex,
+                commandBuffer: nil,
+                bounds: CGRect(x: 0, y: 0, width: fullW, height: fullH),
+                colorSpace: linearSpace
+            )
+
+            // 2. Run the 81-Band Physical Spectral Darkroom Pipeline at full 12MP (3024x4032) resolution
+            guard let developedTex = renderer.renderFullResolutionPhoto(
+                inputLinearTexture: inputLinearTex,
+                params: paramsSnapshot
+            ) else {
+                DispatchQueue.main.async {
+                    self?.isProcessing12MPPhoto = false
+                }
+                return
+            }
+
+            // 3. Encode the developed 12MP texture to Display P3 High-Bitrate JPEG/HEIC (Quality 0.96)
+            let outColorSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
+            guard let outCI = CIImage(mtlTexture: developedTex, options: [.colorSpace: outColorSpace]) else {
+                DispatchQueue.main.async {
+                    self?.isProcessing12MPPhoto = false
+                }
+                return
+            }
+            let orientedOut = outCI.transformed(by: CGAffineTransform(scaleX: 1, y: -1).translatedBy(x: 0, y: -outCI.extent.height))
+
+            guard let jpegData = ciCtx.jpegRepresentation(
+                of: orientedOut,
+                colorSpace: outColorSpace,
+                options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.96]
+            ) else {
+                DispatchQueue.main.async {
+                    self?.isProcessing12MPPhoto = false
+                }
+                return
+            }
+
+            PHPhotoLibrary.shared().performChanges({
+                let req = PHAssetCreationRequest.forAsset()
+                req.addResource(with: .photo, data: jpegData, options: nil)
+            }) { [weak self] saved, _ in
+                DispatchQueue.main.async {
+                    self?.isProcessing12MPPhoto = false
+                    if saved {
+                        self?.statusBannerText = "Saved \(fullW)×\(fullH) (12MP) Spectral Print"
+                    }
                 }
             }
         }
     }
 
-    // MARK: - Real-Time Video Recording (Writes Live Rendered or Log Frames to Movie)
     public func toggleVideoRecording() {
         if isRecordingVideo {
             stopVideoRecording()
@@ -458,16 +533,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
             writerInput.expectsMediaDataInRealTime = true
 
-            let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-                assetWriterInput: writerInput,
-                sourcePixelBufferAttributes: [
-                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                    kCVPixelBufferWidthKey as String: 1080,
-                    kCVPixelBufferHeightKey as String: 1920,
-                    kCVPixelBufferMetalCompatibilityKey as String: true
-                ]
-            )
-
             if writer.canAdd(writerInput) {
                 writer.add(writerInput)
             }
@@ -475,8 +540,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
 
             self.assetWriter = writer
             self.assetWriterVideoInput = writerInput
-            self.assetWriterPixelBufferAdaptor = adaptor
-            self.recordingStartTime = nil
             self.isRecordingVideo = true
             self.statusBannerText = (videoPipelineMode == .logCleanWithFilmMonitor)
                 ? "REC \(logTransferCurve.displayName) + Live Film VF"
@@ -523,16 +586,23 @@ extension CameraCaptureService: AVCaptureVideoDataOutputSampleBufferDelegate, AV
         didFinishProcessingPhoto photo: AVCapturePhoto,
         error: Error?
     ) {
-        guard error == nil, photo.isRawPhoto, let data = photo.fileDataRepresentation() else { return }
-        PHPhotoLibrary.shared().performChanges({
-            let req = PHAssetCreationRequest.forAsset()
-            req.addResource(with: .photo, data: data, options: nil)
-        }) { [weak self] saved, _ in
-            if saved {
-                DispatchQueue.main.async {
-                    self?.statusBannerText = "Saved Spectral Print + 12-Bit ProRAW DNG"
-                }
+        guard error == nil, let data = photo.fileDataRepresentation() else {
+            DispatchQueue.main.async {
+                self.isProcessing12MPPhoto = false
             }
+            return
+        }
+
+        if photo.isRawPhoto {
+            // Optional 12-bit DNG archive save
+            PHPhotoLibrary.shared().performChanges({
+                let req = PHAssetCreationRequest.forAsset()
+                req.addResource(with: .photo, data: data, options: nil)
+            }, completionHandler: nil)
+        } else {
+            // Develop the full 12MP (3024x4032) sensor photo through the 81-band Metal Spectral Darkroom on background queue!
+            let snapshotParams = self.activeParameters
+            processAndSaveFullResolutionPhoto(photoData: data, paramsSnapshot: snapshotParams)
         }
     }
 }
