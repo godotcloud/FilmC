@@ -3,18 +3,20 @@
 //  SpektraCam
 //
 //  Native Darkroom UI & ProMotion MetalKit Viewfinder for iPhone 13 Pro Max (6.7" 428x926 pt)
-//  - Fixed Viewfinder Aspect Ratio & Orientation (3:4 Portrait in Photo Mode, 16:9 in Video Mode with Aspect-Fill Center Crop)
-//  - Responsive Compact Layout so Viewfinder + Film Canisters + 7-Module Darkroom Inspector fit cleanly on 428x926 pt screen
+//  - Zero-Lag Slider Architecture:
+//      `MetalFilmViewfinder` reads `cameraService.activeParameters` directly inside `draw(in:)` without
+//      taking a SwiftUI `@Binding`, so dragging sliders never triggers `updateUIView` or re-creates
+//      the MTKView bridge!
+//  - Exposes ALL darkroom parameters (including Enlarger Light Source, Print Gamma Contrast, B&W Multigrade Grade)
 //
 
 import SwiftUI
 import MetalKit
 import CoreVideo
 
-// MARK: - ProMotion MetalKit Real-Time Spectral Viewfinder
+// MARK: - ProMotion MetalKit Real-Time Spectral Viewfinder (Decoupled from SwiftUI Slider Re-renders)
 public struct MetalFilmViewfinder: UIViewRepresentable {
     @ObservedObject var cameraService: CameraCaptureService
-    @Binding var params: FilmSimulationParameters
 
     public func makeCoordinator() -> Coordinator {
         Coordinator(cameraService: cameraService)
@@ -35,14 +37,11 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
     }
 
     public func updateUIView(_ uiView: MTKView, context: Context) {
-        context.coordinator.currentParams = params
-        context.coordinator.logCurve = cameraService.logTransferCurve
+        // Intentionally lightweight: parameters are read directly from cameraService.activeParameters in draw(in:)
     }
 
     public final class Coordinator: NSObject, MTKViewDelegate {
         let cameraService: CameraCaptureService
-        var currentParams = FilmSimulationParameters()
-        var logCurve: LogEncodingTransferFunction = .appleLogCompatible
 
         init(cameraService: CameraCaptureService) {
             self.cameraService = cameraService
@@ -65,10 +64,13 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
                 return
             }
 
+            let liveParams = cameraService.activeParameters
+            let liveLogCurve = cameraService.logTransferCurve
+
             if let result = renderer.processVideoSampleBuffer(
                 pixelBuffer: pb,
-                params: currentParams,
-                logCurve: logCurve,
+                params: liveParams,
+                logCurve: liveLogCurve,
                 outputDrawableTexture: drawable.texture
             ) {
                 cameraService.updateLatestRenderedTexture(result.filmRenderedTexture)
@@ -108,9 +110,9 @@ public struct SpektraCamMainView: View {
                 // 1. Top Telemetry Bar
                 topTelemetryHeader
 
-                // 2. Real-Time Metal Spectral Viewfinder (Aspect-Fill Center-Cropped in Shader, Zero Distortion)
+                // 2. Real-Time Metal Spectral Viewfinder (Decoupled from @State params for 0ms slider response!)
                 ZStack(alignment: .bottomLeading) {
-                    MetalFilmViewfinder(cameraService: cameraService, params: $params)
+                    MetalFilmViewfinder(cameraService: cameraService)
                         .aspectRatio(cameraService.isCaptureModeVideo ? (16.0 / 9.0) : (3.0 / 4.0), contentMode: .fit)
                         .frame(maxWidth: .infinity)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -123,13 +125,13 @@ public struct SpektraCamMainView: View {
                         lensSelectorPill
                         Spacer()
                         Button {
-                            // One-tap Reset Darkroom Parameters to Calibrated Factory Neutral
                             let currentNeg = params.negativeStockID
                             let currentPrt = params.printStockID
                             var fresh = FilmSimulationParameters()
                             fresh.negativeStockID = currentNeg
                             fresh.printStockID = currentPrt
                             params = fresh
+                            cameraService.activeParameters = fresh
                         } label: {
                             Text("RESET")
                                 .font(.system(size: 10, weight: .bold, design: .monospaced))
@@ -163,6 +165,7 @@ public struct SpektraCamMainView: View {
         }
         .preferredColorScheme(.dark)
         .onAppear {
+            cameraService.activeParameters = params
             cameraService.requestPermissionsAndSetup()
         }
         .onChange(of: params) { newValue in
@@ -299,23 +302,23 @@ public struct SpektraCamMainView: View {
                         }
                         .pickerStyle(.menu)
                         paramSlider(title: "Bloom / Mist Strength", value: $params.bloomStrength, range: 0.0...1.0, unit: "")
-                        paramSlider(title: "Bloom Highlight Cutoff", value: $params.bloomHighlightThreshold, range: 0.2...1.5, unit: "")
-                        paramSlider(title: "Scatter Radius", value: $params.bloomRadiusMicrometers, range: 30.0...350.0, unit: "µm")
+                        paramSlider(title: "Bloom Highlight Cutoff", value: $params.bloomHighlightThreshold, range: 0.15...1.2, unit: "")
+                        paramSlider(title: "Scatter Radius", value: $params.bloomRadiusMicrometers, range: 30.0...450.0, unit: "µm")
 
                     case .couplers:
                         paramSlider(title: "Push / Pull Process", value: $params.pushPullStops, range: -2.0...3.0, unit: "Stops")
                         paramSlider(title: "DIR Coupler Interlayer Inhibition", value: $params.dirCouplerAmount, range: 0.0...2.0, unit: "")
                         paramSlider(title: "DIR Eberhard Edge Radius", value: $params.dirDiffusionRadiusMicrometers, range: 2.0...60.0, unit: "µm")
-                        paramSlider(title: "Developer Exhaustion", value: $params.developerExhaustion, range: 0.0...0.5, unit: "")
+                        paramSlider(title: "Developer Exhaustion", value: $params.developerExhaustion, range: 0.0...0.8, unit: "")
                         paramSlider(title: "Bleach Bypass (Silver Retention)", value: $params.bleachBypassAmount, range: 0.0...1.0, unit: "")
 
                     case .halation:
                         Toggle("Anti-Halation Base Scatter", isOn: $params.halationEnabled)
                             .font(.system(size: 11, design: .monospaced))
-                        paramSlider(title: "Red Layer Halation Strength", value: $params.halationStrengthRGB.x, range: 0.0...0.15, unit: "")
-                        paramSlider(title: "Green Layer Halation Strength", value: $params.halationStrengthRGB.y, range: 0.0...0.06, unit: "")
-                        paramSlider(title: "Red Halation Scatter Sigma", value: $params.halationRadiusMicrometers.x, range: 50.0...450.0, unit: "µm")
-                        paramSlider(title: "Frieser Emulsion Scatter", value: $params.inEmulsionScatterMicrometers, range: 1.0...20.0, unit: "µm")
+                        paramSlider(title: "Red Layer Halation Strength", value: $params.halationStrengthRGB.x, range: 0.0...0.25, unit: "")
+                        paramSlider(title: "Green Layer Halation Strength", value: $params.halationStrengthRGB.y, range: 0.0...0.10, unit: "")
+                        paramSlider(title: "Red Halation Scatter Sigma", value: $params.halationRadiusMicrometers.x, range: 40.0...500.0, unit: "µm")
+                        paramSlider(title: "Frieser Emulsion Scatter", value: $params.inEmulsionScatterMicrometers, range: 0.0...25.0, unit: "µm")
 
                     case .grain:
                         Picker("Film Format Gate Size", selection: $params.filmFormatGate) {
@@ -334,11 +337,19 @@ public struct SpektraCamMainView: View {
                             }
                         }
                         .pickerStyle(.segmented)
-                        paramSlider(title: "Dichroic Yellow Filter (Warm/Cold)", value: $params.dichroicYellowCC, range: -50.0...50.0, unit: "CC")
-                        paramSlider(title: "Dichroic Magenta Filter (Green/Mag)", value: $params.dichroicMagentaCC, range: -50.0...50.0, unit: "CC")
-                        paramSlider(title: "Dichroic Cyan Filter", value: $params.dichroicCyanCC, range: -50.0...50.0, unit: "CC")
+                        Picker("Enlarger Head", selection: $params.enlargerLightSource) {
+                            ForEach(EnlargerLightSourceType.allCases) { src in
+                                Text(src.displayName).tag(src)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        paramSlider(title: "Dichroic Yellow Filter (Warm/Cold)", value: $params.dichroicYellowCC, range: -60.0...60.0, unit: "CC")
+                        paramSlider(title: "Dichroic Magenta Filter (Green/Mag)", value: $params.dichroicMagentaCC, range: -60.0...60.0, unit: "CC")
+                        paramSlider(title: "Dichroic Cyan Filter", value: $params.dichroicCyanCC, range: -60.0...60.0, unit: "CC")
                         paramSlider(title: "Enlarger Print Exposure", value: $params.printExposureEV, range: -2.5...2.5, unit: "EV")
+                        paramSlider(title: "Print Paper Contrast Gamma", value: $params.printGammaContrast, range: 0.65...1.45, unit: "×")
                         paramSlider(title: "Paper Pre-Flashing (Highlight Save)", value: $params.preflashExposureEV, range: -6.0...(-1.0), unit: "EV")
+                        paramSlider(title: "Ilford Multigrade Contrast (00–5)", value: $params.bwMultigradeFilterGrade, range: 0.0...5.0, unit: "G")
 
                     case .scanner:
                         Picker("Target Display Space", selection: $params.outputColorSpace) {
@@ -347,14 +358,14 @@ public struct SpektraCamMainView: View {
                             }
                         }
                         .pickerStyle(.segmented)
-                        paramSlider(title: "Scanner Veiling Glare", value: $params.scannerVeilingGlare, range: 0.0...0.03, unit: "")
-                        paramSlider(title: "Scanner Black Point Offset", value: $params.blackPointOffset, range: -0.05...0.05, unit: "")
-                        paramSlider(title: "Scanner White Point Gain", value: $params.whitePointOffset, range: -0.10...0.10, unit: "")
+                        paramSlider(title: "Scanner Veiling Glare", value: $params.scannerVeilingGlare, range: 0.0...0.05, unit: "")
+                        paramSlider(title: "Scanner Black Point Offset", value: $params.blackPointOffset, range: -0.08...0.08, unit: "")
+                        paramSlider(title: "Scanner White Point Gain", value: $params.whitePointOffset, range: -0.15...0.15, unit: "")
                     }
                 }
                 .padding(8)
             }
-            .frame(height: 145)
+            .frame(height: 150)
             .background(Color(white: 0.09))
             .cornerRadius(10)
         }

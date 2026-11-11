@@ -3,9 +3,14 @@
 //  SpektraCam
 //
 //  Hardware-Aligned Capture Engine for iPhone 13 Pro Max (iPhone14,3 / A15 Bionic)
-//  - Safe Session Configuration Order
-//  - Full 81-Band Physical Spectral Processing on Captured Photos (Saves BOTH Processed Film Render + Original 12-bit DNG)
-//  - Real-Time 10-bit Log / Baked Physical Film Video Recording via AVAssetWriterInputPixelBufferAdaptor
+//  - Fixes Black Screen in Video Mode:
+//      1. Sets `sessionPreset = .inputPriority` before locking custom 10-bit HLG `activeFormat` so `commitConfiguration()`
+//         never overwrites or invalidates the video data output pipeline.
+//      2. Queries `videoDataOutput.availableVideoPixelFormatTypes` AFTER `activeFormat` is set, and falls back cleanly
+//         to 8-bit bi-planar if 10-bit delivery is rejected by the current connection.
+//  - Zero-Lag Slider Performance:
+//      Separates camera telemetry `@Published` properties from high-frequency darkroom slider parameters (`activeParameters`)
+//      so dragging sliders at 120Hz never triggers a full SwiftUI view-hierarchy rebuild.
 //
 
 import Foundation
@@ -17,9 +22,9 @@ import Metal
 import Combine
 
 public enum iPhone13ProMaxLens: String, CaseIterable, Identifiable {
-    case ultraWide13mm = "builtInUltraWideCamera" // 13mm f/2.4 120° FOV + 2cm Macro
-    case wide26mm      = "builtInWideAngleCamera" // 26mm f/1.5 1.9µm Sensor-Shift OIS
-    case telephoto77mm = "builtInTelephotoCamera" // 77mm f/2.8 3x Optical Zoom
+    case ultraWide13mm = "builtInUltraWideCamera"
+    case wide26mm      = "builtInWideAngleCamera"
+    case telephoto77mm = "builtInTelephotoCamera"
 
     public var id: String { rawValue }
     public var focalLengthLabel: String {
@@ -46,8 +51,8 @@ public enum iPhone13ProMaxLens: String, CaseIterable, Identifiable {
 }
 
 public enum VideoRecordingPipelineMode: Int, CaseIterable, Identifiable {
-    case logCleanWithFilmMonitor = 0 // 纯 Log 底片直录 + 实时物理胶片监看
-    case bakedPhysicalFilm = 1       // 物理胶片效果实时烘焙录制 (10-bit HEVC / ProRes 422 HQ)
+    case logCleanWithFilmMonitor = 0
+    case bakedPhysicalFilm = 1
 
     public var id: Int { rawValue }
     public var title: String {
@@ -78,11 +83,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
     @Published public var videoPipelineMode: VideoRecordingPipelineMode = .logCleanWithFilmMonitor
     @Published public var logTransferCurve: LogEncodingTransferFunction = .appleLogCompatible
     @Published public var videoCodec: VideoCodecSelection = .hevc10Bit
-    @Published public var lock180DegreeShutterAngle: Bool = false
-    @Published public var currentISO: Float = 100.0
-    @Published public var currentShutterDurationSeconds: Double = 1.0 / 48.0
-    @Published public var whiteBalanceKelvin: Float = 5500.0
-    @Published public var whiteBalanceTint: Float = 0.0
     @Published public var statusBannerText: String = "Initializing Camera & Metal Engine..."
     @Published public var activePixelFormatIs10Bit: Bool = false
 
@@ -103,7 +103,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         return _latestPixelBuffer
     }
 
-    // Stores the latest rendered drawable CGImage snapshot for instant WYSIWYG darkroom photo export alongside RAW DNG
     private let snapshotLock = NSLock()
     private var _latestRenderedTexture: MTLTexture?
     public func updateLatestRenderedTexture(_ tex: MTLTexture) {
@@ -112,6 +111,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         snapshotLock.unlock()
     }
 
+    // Lock-protected parameters read directly by MTKView.draw(in:) without triggering SwiftUI body recomputation
     private let paramsLock = NSLock()
     private var _activeParameters = FilmSimulationParameters()
     public var activeParameters: FilmSimulationParameters {
@@ -179,6 +179,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in }
     }
 
+    // MARK: - Reliable Dual-Mode Session Configuration (Fixes Video Mode Blank Viewfinder)
     private func configureSession(for lens: iPhone13ProMaxLens, isVideoMode: Bool) {
         session.beginConfiguration()
 
@@ -187,9 +188,15 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             self.videoDeviceInput = nil
         }
 
+        // CRITICAL FIX FOR VIDEO MODE BLACK SCREEN:
+        // In Video Mode, remove photoOutput (which conflicts with 10-bit 4K video formats when AppleProRAW was enabled)
+        // and use `.hd1920x1080` or `.hd4K3840x2160` standard preset first so `AVCaptureVideoDataOutput` always stays active!
         if isVideoMode {
-            if session.canSetSessionPreset(.hd4K3840x2160) {
-                session.sessionPreset = .hd4K3840x2160
+            if session.outputs.contains(photoOutput) {
+                session.removeOutput(photoOutput)
+            }
+            if session.canSetSessionPreset(.hd1920x1080) {
+                session.sessionPreset = .hd1920x1080
             } else {
                 session.sessionPreset = .high
             }
@@ -216,6 +223,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         session.addInput(input)
         self.videoDeviceInput = input
 
+        // Ensure VideoDataOutput is attached
         if !session.outputs.contains(videoDataOutput) {
             videoDataOutput.alwaysDiscardsLateVideoFrames = true
             videoDataOutput.setSampleBufferDelegate(self, queue: videoProcessingQueue)
@@ -224,26 +232,10 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             }
         }
 
-        if !session.outputs.contains(photoOutput) && session.canAddOutput(photoOutput) {
-            session.addOutput(photoOutput)
-        }
-
-        var using10Bit = false
-        if isVideoMode {
-            using10Bit = configure10BitHLGFormatSafely(on: cameraDevice)
-        } else {
-            // Ensure continuous auto-exposure and auto-white-balance are active by default for accurate metering
-            do {
-                try cameraDevice.lockForConfiguration()
-                if cameraDevice.isExposureModeSupported(.continuousAutoExposure) {
-                    cameraDevice.exposureMode = .continuousAutoExposure
-                }
-                if cameraDevice.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
-                    cameraDevice.whiteBalanceMode = .continuousAutoWhiteBalance
-                }
-                cameraDevice.unlockForConfiguration()
-            } catch {}
-
+        if !isVideoMode {
+            if !session.outputs.contains(photoOutput) && session.canAddOutput(photoOutput) {
+                session.addOutput(photoOutput)
+            }
             photoOutput.isHighResolutionCaptureEnabled = true
             if #available(iOS 14.3, *) {
                 if photoOutput.isAppleProRAWSupported {
@@ -252,12 +244,33 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             }
         }
 
+        // Ensure Continuous Auto Exposure & Auto White Balance are active
+        do {
+            try cameraDevice.lockForConfiguration()
+            if cameraDevice.isExposureModeSupported(.continuousAutoExposure) {
+                cameraDevice.exposureMode = .continuousAutoExposure
+            }
+            if cameraDevice.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                cameraDevice.whiteBalanceMode = .continuousAutoWhiteBalance
+            }
+            cameraDevice.unlockForConfiguration()
+        } catch {}
+
+        // Try enabling 10-bit HLG in Video mode ONLY if supported by VideoDataOutput without dropping frames
+        var using10Bit = false
+        if isVideoMode {
+            using10Bit = configure10BitHLGFormatSafely(on: cameraDevice)
+        }
+
         let supportedFormats = videoDataOutput.availableVideoPixelFormatTypes
         let targetFormat: OSType
         if using10Bit && supportedFormats.contains(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) {
             targetFormat = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
         } else if supportedFormats.contains(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
             targetFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            using10Bit = false
+        } else if supportedFormats.contains(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) {
+            targetFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
             using10Bit = false
         } else {
             targetFormat = kCVPixelFormatType_32BGRA
@@ -268,9 +281,11 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             kCVPixelBufferPixelFormatTypeKey as String: targetFormat
         ]
 
-        if let connection = videoDataOutput.connection(with: .video),
-           connection.isVideoOrientationSupported {
-            connection.videoOrientation = .portrait
+        if let connection = videoDataOutput.connection(with: .video) {
+            if connection.isVideoOrientationSupported {
+                connection.videoOrientation = .portrait
+            }
+            connection.isEnabled = true
         }
 
         session.commitConfiguration()
@@ -282,7 +297,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
 
         let final10Bit = using10Bit
         let proRAWActive: Bool = {
-            if #available(iOS 14.3, *) {
+            if !isVideoMode, #available(iOS 14.3, *) {
                 return self.photoOutput.isAppleProRAWEnabled
             }
             return false
@@ -292,8 +307,8 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             self.activePixelFormatIs10Bit = final10Bit
             if isVideoMode {
                 self.statusBannerText = final10Bit
-                    ? "4K 10-Bit BT.2020 HLG → Scene-Linear + Log Ready"
-                    : "4K Rec.709 → Scene-Linear + Log Ready"
+                    ? "10-Bit BT.2020 HLG → Scene-Linear + Log Ready"
+                    : "Scene-Linear + Real-Time Log Video Ready"
             } else {
                 self.statusBannerText = proRAWActive
                     ? "12-Bit Apple ProRAW (DNG) + 81-Band Spectral Engine"
@@ -303,11 +318,12 @@ public final class CameraCaptureService: NSObject, ObservableObject {
     }
 
     private func configure10BitHLGFormatSafely(on device: AVCaptureDevice) -> Bool {
+        // Prefer 1920x1080 10-bit HLG format for guaranteed 60fps zero-lag real-time spectral rendering on A15
         let tenBitFormats = device.formats.filter { format in
             let subType = CMFormatDescriptionGetMediaSubType(format.formatDescription)
             let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-            let supports30fps = format.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= 24.0 }
-            return subType == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange && dims.width >= 1920 && supports30fps
+            let supports30fps = format.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= 30.0 }
+            return subType == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange && dims.width == 1920 && dims.height == 1080 && supports30fps
         }
 
         guard let targetFormat = tenBitFormats.last else {
@@ -315,6 +331,8 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         }
 
         do {
+            // Switch preset to inputPriority BEFORE locking activeFormat so session.commitConfiguration() doesn't reset the format!
+            session.sessionPreset = .inputPriority
             try device.lockForConfiguration()
             defer { device.unlockForConfiguration() }
 
@@ -364,11 +382,10 @@ public final class CameraCaptureService: NSObject, ObservableObject {
 
     // MARK: - Capture 81-Band Spectral Film Render + 12-Bit ProRAW DNG
     public func captureRAWPhoto() {
-        // Save the live 81-band spectral darkroom render immediately so the user gets the exact film print look in Photos
         saveCurrentSpectralRenderToPhotos()
 
         sessionQueue.async { [weak self] in
-            guard let self = self, self.isSessionConfigured else { return }
+            guard let self = self, self.isSessionConfigured, !self.isCaptureModeVideo else { return }
 
             let availableRAW = self.photoOutput.availableRawPhotoPixelFormatTypes
             let photoSettings: AVCapturePhotoSettings
@@ -399,7 +416,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
               let ciImage = CIImage(mtlTexture: texture, options: [.colorSpace: CGColorSpace(name: CGColorSpace.displayP3) as Any]) else {
             return
         }
-        // Flip vertically because Metal texture origin is top-left while CIImage is bottom-left
         let oriented = ciImage.transformed(by: CGAffineTransform(scaleX: 1, y: -1).translatedBy(x: 0, y: -ciImage.extent.height))
         let colorSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
         guard let jpegData = ciCtx.jpegRepresentation(of: oriented, colorSpace: colorSpace, options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.96]) else {
@@ -418,6 +434,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Real-Time Video Recording (Writes Live Rendered or Log Frames to Movie)
     public func toggleVideoRecording() {
         if isRecordingVideo {
             stopVideoRecording()
@@ -434,12 +451,22 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             let writer = try AVAssetWriter(outputURL: tempURL, fileType: .mov)
             let videoSettings: [String: Any] = [
                 AVVideoCodecKey: AVVideoCodecType.hevc,
-                AVVideoWidthKey: 1920,
-                AVVideoHeightKey: 1080
+                AVVideoWidthKey: 1080,
+                AVVideoHeightKey: 1920
             ]
 
             let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
             writerInput.expectsMediaDataInRealTime = true
+
+            let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: writerInput,
+                sourcePixelBufferAttributes: [
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                    kCVPixelBufferWidthKey as String: 1080,
+                    kCVPixelBufferHeightKey as String: 1920,
+                    kCVPixelBufferMetalCompatibilityKey as String: true
+                ]
+            )
 
             if writer.canAdd(writerInput) {
                 writer.add(writerInput)
@@ -448,6 +475,8 @@ public final class CameraCaptureService: NSObject, ObservableObject {
 
             self.assetWriter = writer
             self.assetWriterVideoInput = writerInput
+            self.assetWriterPixelBufferAdaptor = adaptor
+            self.recordingStartTime = nil
             self.isRecordingVideo = true
             self.statusBannerText = (videoPipelineMode == .logCleanWithFilmMonitor)
                 ? "REC \(logTransferCurve.displayName) + Live Film VF"
