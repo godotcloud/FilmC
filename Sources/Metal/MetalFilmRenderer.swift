@@ -3,12 +3,15 @@
 //  SpektraCam
 //
 //  A15 Bionic Zero-Copy Metal Compute Pipeline Manager
-//  - Closed-Loop Sensitometric & Unit Optical Density Calibration (Verified in Python against ColorChecker & Gray Ramp):
-//    1. Step A: Negative Spectral Sensitivity Pre-Normalization against Reference Scene Illuminant (18% Gray -> (0.18, 0.18, 0.18))
-//    2. Step B: Two-Point Negative Dye Slope Calibration under 3200K Enlarger Light (Ensures shadow-to-highlight neutral negative density
-//       produces an exact 1.20-stop log-exposure span across all 3 RA-4 paper layers, preventing low-contrast washed-out gray prints!)
-//    3. Step C: Enlarger Mid-Gray (18%) Calibration to exact (0.18, 0.18, 0.18) Print Exposure at 0 CC Dichroic Filter Shift
-//    4. Step D: Unit Optical Density (END = 1.0 -> Transmittance = 0.10) Calibration for Print C/M/Y Dyes + D65 CIE 1931 XYZ Normalization
+//  - Universal Reference Darkroom Calibration (Preserves 100% of Per-Stock Sensitometric & Spectral Identity!):
+//    1. Calibrates the Enlarger 3200K Light & Scanner 5500K CIE 1931 XYZ Tables ONCE against a fixed Reference Neutral Emulsion,
+//       NEVER flattening individual film stocks' spectral peaks, dye curves, tungsten/daylight balance, or H-D contrast!
+//    2. Preserves the full 3x3 DIR Interlayer Chemical Inhibition Matrix (Zero-Sum Row-Normalized so neutral gray stays neutral
+//       while off-diagonal terms drive authentic Portra pastel skin vs Ektar/Velvia intense chroma vs Fuji 4th-layer emerald greens).
+//    3. Preserves Tungsten (3200K) vs Daylight (5500K) spectral illuminant response (so CineStill 800T / Vision3 500T exhibit
+//       their signature cool cyan-blue shadow balance and intense red halation).
+//    4. Preserves each stock's defaultEnlargerYMShift and each print stock's (Endura vs Crystal Archive II vs Kodak 2383 vs 3513DI)
+//       unique dye absorption spectra and contrast gamma.
 //
 
 import Foundation
@@ -44,6 +47,12 @@ public final class MetalFilmRenderer {
     private var frameCounter: UInt32 = 1
     private var cachedNegStockID: String = ""
     private var cachedPrintStockID: String = ""
+    private var cachedSceneKelvin: Float = -1.0
+
+    // Fixed Universal Reference Darkroom Calibration Constants (computed once at startup so stock differences are never erased!)
+    private var universalNegDyeScale = SIMD3<Float>(1.38, 0.88, 1.15)
+    private var universalPrtSensScale = SIMD3<Float>(1.0, 1.0, 1.0)
+    private var universalPrtDyeScale = SIMD3<Float>(1.046, 0.919, 1.023)
 
     public init?() {
         guard let dev = MTLCreateSystemDefaultDevice(),
@@ -89,7 +98,7 @@ public final class MetalFilmRenderer {
         self.bufPrintDyeAndScanner = b4
         self.bufCIE1931XYZ = b5
 
-        populateCIE1931XYZTable()
+        calibrateUniversalReferenceDarkroom()
         updateSpectralTablesIfNeeded(negID: "kodak_portra_400", printID: "kodak_endura_premier", sceneKelvin: 5500)
     }
 
@@ -114,8 +123,21 @@ public final class MetalFilmRenderer {
         self.currentAllocatedSize = (width, height)
     }
 
-    private func populateCIE1931XYZTable() {
-        let ptr = bufCIE1931XYZ.contents().bindMemory(to: SIMD4<Float>.self, capacity: 81)
+    private func blackbodyNormalized(lambdaNM: Float, kelvin: Float) -> Float {
+        let T: Float = max(kelvin, 2000.0)
+        let lamM: Float = lambdaNM * 1e-9
+        let c2: Float = 1.438777e-2
+        let val: Float = (1.0 / powf(lamM, 5.0)) / (expf(c2 / (lamM * T)) - 1.0)
+        let ref555: Float = (1.0 / powf(555e-9, 5.0)) / (expf(c2 / (555e-9 * T)) - 1.0)
+        return val / max(ref555, 1e-12)
+    }
+
+    // MARK: - One-Time Universal Reference Darkroom Calibration
+    // Calibrates the enlarger light source and scanner CIE 1931 XYZ tables against a single canonical reference stock
+    // (Portra 400 + Endura Premier), so switching between any of the 22 films or 5 print stocks preserves 100% of their
+    // relative color, contrast, dye peak, and tungsten/daylight differences!
+    private func calibrateUniversalReferenceDarkroom() {
+        let ptrCMF = bufCIE1931XYZ.contents().bindMemory(to: SIMD4<Float>.self, capacity: 81)
         var ySum: Float = 0.0
         for i in 0..<81 {
             let lambda = Float(380 + i * 5)
@@ -135,113 +157,15 @@ public final class MetalFilmRenderer {
             let cx = max(xBar, 0.0)
             let cy = max(yBar, 0.0)
             let cz = max(zBar, 0.0)
-            ptr[i] = SIMD4<Float>(cx, cy, cz, 0.0)
+            ptrCMF[i] = SIMD4<Float>(cx, cy, cz, 0.0)
             ySum += cy
         }
         let invYSum = 1.0 / max(ySum, 1e-5)
         for i in 0..<81 {
-            ptr[i] *= invYSum
-        }
-    }
-
-    private func blackbodyNormalized(lambdaNM: Float, kelvin: Float) -> Float {
-        let T: Float = max(kelvin, 2000.0)
-        let lamM: Float = lambdaNM * 1e-9
-        let c2: Float = 1.438777e-2
-        let val: Float = (1.0 / powf(lamM, 5.0)) / (expf(c2 / (lamM * T)) - 1.0)
-        let ref555: Float = (1.0 / powf(555e-9, 5.0)) / (expf(c2 / (555e-9 * T)) - 1.0)
-        return val / max(ref555, 1e-12)
-    }
-
-    // MARK: - Closed-Loop Darkroom Sensitometric & Unit Optical Density Calibration
-    public func updateSpectralTablesIfNeeded(negID: String, printID: String, sceneKelvin: Float) {
-        guard negID != cachedNegStockID || printID != cachedPrintStockID else { return }
-        cachedNegStockID = negID
-        cachedPrintStockID = printID
-
-        let negStock = FilmStockDatabase.cameraStock(withID: negID)
-        let printStock = FilmStockDatabase.printStock(withID: printID)
-
-        // Reset CIE 1931 base table before re-scaling
-        populateCIE1931XYZTable()
-
-        let negSens = negStock.evaluateSpectralSensitivities81()
-        let rawNegDye = negStock.evaluateDyeSpectralDensities81()
-        let prtSens = printStock.evaluateSpectralSensitivities81()
-        let rawPrtDye = printStock.evaluateDyeSpectralDensities81()
-
-        let ptrSens = bufSpectralSensitivity.contents().bindMemory(to: SIMD4<Float>.self, capacity: 81)
-        let ptrNegDye = bufNegDyeAndEnlarger.contents().bindMemory(to: SIMD4<Float>.self, capacity: 81)
-        let ptrPrtSens = bufPrintSens.contents().bindMemory(to: SIMD4<Float>.self, capacity: 81)
-        let ptrPrtDye = bufPrintDyeAndScanner.contents().bindMemory(to: SIMD4<Float>.self, capacity: 81)
-        let ptrCMF = bufCIE1931XYZ.contents().bindMemory(to: SIMD4<Float>.self, capacity: 81)
-
-        let zeroVec = SIMD3<Float>(0.0, 0.0, 0.0)
-
-        // Step A: Pre-normalize negative sensitivity * reference illuminant so a flat reflector yields (1, 1, 1)
-        var negIllumIntegral = SIMD3<Float>(1e-6, 1e-6, 1e-6)
-        for i in 0..<81 {
-            let lambda = Float(380 + i * 5)
-            let sceneIllum = blackbodyNormalized(lambdaNM: lambda, kelvin: negStock.referenceKelvin)
-            negIllumIntegral += negSens[i] * sceneIllum
-        }
-        for i in 0..<81 {
-            let lambda = Float(380 + i * 5)
-            let sceneIllum = blackbodyNormalized(lambdaNM: lambda, kelvin: negStock.referenceKelvin)
-            let normSens = (negSens[i] * sceneIllum) / negIllumIntegral
-            ptrSens[i] = SIMD4<Float>(normSens.x, normSens.y, normSens.z, 1.0)
+            ptrCMF[i] *= invYSum
         }
 
-        // Step B: Two-Point Negative Dye Slope Calibration under 3200K Enlarger Light!
-        // Ensures moving from shadow negative density (0.2 * spanN) to highlight negative density (0.8 * spanN)
-        // produces an exact 1.20-stop log10 exposure ratio (10^-1.20 = 0.0631) across all 3 print layers (R, G, B)!
-        // This guarantees full contrast range on the print paper and eliminates highlight cyan or shadow red casts.
-        let spanN: SIMD3<Float> = simd_max(negStock.dMaxRGB - negStock.dMinRGB, SIMD3<Float>(0.2, 0.2, 0.2))
-        var negDyeScale = SIMD3<Float>(1.2, 1.0, 1.1)
-
-        if !negStock.isMonochrome {
-            for _ in 0..<20 {
-                var tLow = SIMD3<Float>(1e-6, 1e-6, 1e-6)
-                var tHigh = SIMD3<Float>(1e-6, 1e-6, 1e-6)
-                for i in 0..<81 {
-                    let lambda = Float(380 + i * 5)
-                    let enlIllum = blackbodyNormalized(lambdaNM: lambda, kelvin: 3200.0)
-                    let cleanNegDye = simd_max(rawNegDye[i], zeroVec) * negDyeScale
-                    let dLow: Float = simd_dot(0.2 * spanN, cleanNegDye)
-                    let dHigh: Float = simd_dot(0.8 * spanN, cleanNegDye)
-                    tLow += (enlIllum * powf(10.0, -min(max(dLow, 0.0), 4.5))) * prtSens[i]
-                    tHigh += (enlIllum * powf(10.0, -min(max(dHigh, 0.0), 4.5))) * prtSens[i]
-                }
-                let ratio: SIMD3<Float> = (tHigh / tLow) / 0.0631
-                negDyeScale.x *= powf(max(ratio.x, 0.2), 0.55)
-                negDyeScale.y *= powf(max(ratio.y, 0.2), 0.55)
-                negDyeScale.z *= powf(max(ratio.z, 0.2), 0.55)
-            }
-        } else {
-            // For monochrome silver negatives, calibrate uniform optical density
-            negDyeScale = SIMD3<Float>(0.38, 0.38, 0.38)
-        }
-
-        // Step C: Normalize Print Paper Sensitivity at 18% Middle Gray Negative (0.5 * spanN) -> (0.18, 0.18, 0.18) Print Exposure
-        let midNetNeg: SIMD3<Float> = 0.5 * spanN
-        var printMidExposureIntegral = SIMD3<Float>(1e-6, 1e-6, 1e-6)
-        for i in 0..<81 {
-            let lambda = Float(380 + i * 5)
-            let enlargerIllum = blackbodyNormalized(lambdaNM: lambda, kelvin: 3200.0)
-            let scaledNegDye: SIMD3<Float> = simd_max(rawNegDye[i], zeroVec) * negDyeScale
-            ptrNegDye[i] = SIMD4<Float>(scaledNegDye.x, scaledNegDye.y, scaledNegDye.z, enlargerIllum)
-
-            let negSpecD: Float = simd_dot(midNetNeg, scaledNegDye)
-            let trans: Float = powf(10.0, -min(max(negSpecD, 0.0), 4.5))
-            printMidExposureIntegral += (enlargerIllum * trans) * prtSens[i]
-        }
-
-        for i in 0..<81 {
-            let normPrtSens = (prtSens[i] * 0.18) / printMidExposureIntegral
-            ptrPrtSens[i] = SIMD4<Float>(normPrtSens.x, normPrtSens.y, normPrtSens.z, 1.0)
-        }
-
-        // Step D: Normalize Scanner Illuminant * CIE 1931 CMF to D65 White XYZ (0.95047, 1.00000, 1.08883)
+        // Normalize CIE 1931 CMFs under 5500K Scanner Illuminant to D65 White (0.95047, 1.00000, 1.08883)
         var rawWhiteXYZ = SIMD3<Float>(1e-6, 1e-6, 1e-6)
         for i in 0..<81 {
             let lambda = Float(380 + i * 5)
@@ -260,39 +184,127 @@ public final class MetalFilmRenderer {
             )
         }
 
-        // Step E: Unit Optical Density Calibration (END = 1.0 -> Transmittance = 0.10 * D65 White) for Print C/M/Y Dyes!
-        // Previously, unscaled print dye sum was only ~0.42 across the 81 bands, so D_max = 2.2 only absorbed 10^(-0.9) = 12% light
-        // (causing washed-out gray shadows of ~0.22 and dim gray highlights of ~0.62!).
-        // Scaling print dyes so D = (1.0, 1.0, 1.0) produces exact T = 10^(-1.0) = 0.10 restores deep blacks (D=2.2 -> T=0.006) and crisp whites!
-        var prtDyeScale = SIMD3<Float>(1.5, 1.5, 1.5)
-        if !printStock.isMonochrome {
-            for _ in 0..<15 {
-                var midXYZ = SIMD3<Float>(1e-6, 1e-6, 1e-6)
-                for i in 0..<81 {
-                    let lambda = Float(380 + i * 5)
-                    let scannerIllum = blackbodyNormalized(lambdaNM: lambda, kelvin: 5500.0)
-                    let clampedDye = simd_max(rawPrtDye[i], zeroVec)
-                    let dVec: SIMD3<Float> = clampedDye * prtDyeScale
-                    let specD: Float = dVec.x + dVec.y + dVec.z
-                    let trans: Float = powf(10.0, -specD)
-                    let cmf = SIMD3<Float>(ptrCMF[i].x, ptrCMF[i].y, ptrCMF[i].z)
-                    midXYZ += (scannerIllum * trans) * cmf
-                }
-                let targetXYZ: SIMD3<Float> = d65White * 0.10
-                let ratio: SIMD3<Float> = midXYZ / targetXYZ
-                prtDyeScale.x *= powf(max(ratio.x, 0.2), 0.65)
-                prtDyeScale.y *= powf(max(ratio.y, 0.2), 0.65)
-                prtDyeScale.z *= powf(max(ratio.z, 0.2), 0.65)
+        // Reference negative (Portra 400) & Reference print paper (Endura Premier)
+        let refNeg = FilmStockDatabase.cameraStock(withID: "kodak_portra_400")
+        let refPrt = FilmStockDatabase.printStock(withID: "kodak_endura_premier")
+        let rawNegDye = refNeg.evaluateDyeSpectralDensities81()
+        let rawPrtSens = refPrt.evaluateSpectralSensitivities81()
+        let rawPrtDye = refPrt.evaluateDyeSpectralDensities81()
+        let zeroVec = SIMD3<Float>(0.0, 0.0, 0.0)
+        let refSpan = SIMD3<Float>(2.0, 2.0, 2.0)
+
+        var negScale = SIMD3<Float>(1.2, 1.0, 1.1)
+        for _ in 0..<20 {
+            var tLow = SIMD3<Float>(1e-6, 1e-6, 1e-6)
+            var tHigh = SIMD3<Float>(1e-6, 1e-6, 1e-6)
+            for i in 0..<81 {
+                let lambda = Float(380 + i * 5)
+                let enlIllum = blackbodyNormalized(lambdaNM: lambda, kelvin: 3200.0)
+                let cleanNegDye = simd_max(rawNegDye[i], zeroVec) * negScale
+                let dLow: Float = simd_dot(0.2 * refSpan, cleanNegDye)
+                let dHigh: Float = simd_dot(0.8 * refSpan, cleanNegDye)
+                tLow += (enlIllum * powf(10.0, -min(max(dLow, 0.0), 4.5))) * rawPrtSens[i]
+                tHigh += (enlIllum * powf(10.0, -min(max(dHigh, 0.0), 4.5))) * rawPrtSens[i]
             }
-        } else {
-            prtDyeScale = SIMD3<Float>(0.34, 0.34, 0.34)
+            let ratio: SIMD3<Float> = (tHigh / tLow) / 0.0631
+            negScale.x *= powf(max(ratio.x, 0.2), 0.55)
+            negScale.y *= powf(max(ratio.y, 0.2), 0.55)
+            negScale.z *= powf(max(ratio.z, 0.2), 0.55)
+        }
+        self.universalNegDyeScale = negScale
+
+        var midPrtExp = SIMD3<Float>(1e-6, 1e-6, 1e-6)
+        for i in 0..<81 {
+            let lambda = Float(380 + i * 5)
+            let enlIllum = blackbodyNormalized(lambdaNM: lambda, kelvin: 3200.0)
+            let scaledNegDye = simd_max(rawNegDye[i], zeroVec) * negScale
+            let specD: Float = simd_dot(0.5 * refSpan, scaledNegDye)
+            midPrtExp += (enlIllum * powf(10.0, -min(max(specD, 0.0), 4.5))) * rawPrtSens[i]
+        }
+        self.universalPrtSensScale = SIMD3<Float>(0.18, 0.18, 0.18) / midPrtExp
+
+        var prtScale = SIMD3<Float>(1.5, 1.5, 1.5)
+        for _ in 0..<15 {
+            var midXYZ = SIMD3<Float>(1e-6, 1e-6, 1e-6)
+            for i in 0..<81 {
+                let lambda = Float(380 + i * 5)
+                let scannerIllum = blackbodyNormalized(lambdaNM: lambda, kelvin: 5500.0)
+                let dVec: SIMD3<Float> = simd_max(rawPrtDye[i], zeroVec) * prtScale
+                let specD: Float = dVec.x + dVec.y + dVec.z
+                let trans: Float = powf(10.0, -specD)
+                let cmf = SIMD3<Float>(ptrCMF[i].x, ptrCMF[i].y, ptrCMF[i].z)
+                midXYZ += (scannerIllum * trans) * cmf
+            }
+            let ratio: SIMD3<Float> = midXYZ / (d65White * 0.10)
+            prtScale.x *= powf(max(ratio.x, 0.2), 0.65)
+            prtScale.y *= powf(max(ratio.y, 0.2), 0.65)
+            prtScale.z *= powf(max(ratio.z, 0.2), 0.65)
+        }
+        self.universalPrtDyeScale = prtScale
+    }
+
+    // MARK: - Update Per-Stock Spectral Curves (Preserving Stock-Specific Spectral Peaks, Dyes & Kelvin Balance)
+    public func updateSpectralTablesIfNeeded(negID: String, printID: String, sceneKelvin: Float) {
+        guard negID != cachedNegStockID || printID != cachedPrintStockID || abs(sceneKelvin - cachedSceneKelvin) > 10.0 else { return }
+        cachedNegStockID = negID
+        cachedPrintStockID = printID
+        cachedSceneKelvin = sceneKelvin
+
+        let negStock = FilmStockDatabase.cameraStock(withID: negID)
+        let printStock = FilmStockDatabase.printStock(withID: printID)
+
+        let negSens = negStock.evaluateSpectralSensitivities81()
+        let rawNegDye = negStock.evaluateDyeSpectralDensities81()
+        let prtSens = printStock.evaluateSpectralSensitivities81()
+        let rawPrtDye = printStock.evaluateDyeSpectralDensities81()
+
+        let ptrSens = bufSpectralSensitivity.contents().bindMemory(to: SIMD4<Float>.self, capacity: 81)
+        let ptrNegDye = bufNegDyeAndEnlarger.contents().bindMemory(to: SIMD4<Float>.self, capacity: 81)
+        let ptrPrtSens = bufPrintSens.contents().bindMemory(to: SIMD4<Float>.self, capacity: 81)
+        let ptrPrtDye = bufPrintDyeAndScanner.contents().bindMemory(to: SIMD4<Float>.self, capacity: 81)
+
+        let zeroVec = SIMD3<Float>(0.0, 0.0, 0.0)
+
+        // 1. Negative Spectral Sensitivity:
+        // Normalize under the stock's OWN calibrated reference Kelvin (e.g. 3200K for CineStill 800T / Vision3 500T, 5500K for Daylight stocks),
+        // while illuminating the scene with `sceneKelvin` (default 5500K).
+        // Blending 38% of the illuminant mismatch preserves the authentic cool tungsten-in-daylight look of 800T/500T/200T!
+        var refIllumIntegral = SIMD3<Float>(1e-6, 1e-6, 1e-6)
+        for i in 0..<81 {
+            let lambda = Float(380 + i * 5)
+            let refIllum = blackbodyNormalized(lambdaNM: lambda, kelvin: negStock.referenceKelvin)
+            refIllumIntegral += negSens[i] * refIllum
+        }
+        for i in 0..<81 {
+            let lambda = Float(380 + i * 5)
+            let refIllum = blackbodyNormalized(lambdaNM: lambda, kelvin: negStock.referenceKelvin)
+            let actIllum = blackbodyNormalized(lambdaNM: lambda, kelvin: sceneKelvin)
+            let effIllum: Float = 0.62 * refIllum + 0.38 * actIllum
+            let normSens = (negSens[i] * effIllum) / refIllumIntegral
+            ptrSens[i] = SIMD4<Float>(normSens.x, normSens.y, normSens.z, 1.0)
         }
 
+        // 2. Negative Dye Absorption Spectrum (scaled by universalNegDyeScale so per-stock dye peak differences are preserved!)
+        let effNegScale: SIMD3<Float> = negStock.isMonochrome ? SIMD3<Float>(0.38, 0.38, 0.38) : universalNegDyeScale
+        for i in 0..<81 {
+            let lambda = Float(380 + i * 5)
+            let enlargerIllum = blackbodyNormalized(lambdaNM: lambda, kelvin: 3200.0)
+            let scaledNegDye: SIMD3<Float> = simd_max(rawNegDye[i], zeroVec) * effNegScale
+            ptrNegDye[i] = SIMD4<Float>(scaledNegDye.x, scaledNegDye.y, scaledNegDye.z, enlargerIllum)
+        }
+
+        // 3. Print Stock Spectral Sensitivity (scaled by universalPrtSensScale)
+        for i in 0..<81 {
+            let normPrtSens = prtSens[i] * universalPrtSensScale
+            ptrPrtSens[i] = SIMD4<Float>(normPrtSens.x, normPrtSens.y, normPrtSens.z, 1.0)
+        }
+
+        // 4. Print Stock Dye Absorption Spectrum (scaled by universalPrtDyeScale so Endura vs Crystal Archive vs 2383 dye peaks differ!)
+        let effPrtScale: SIMD3<Float> = printStock.isMonochrome ? SIMD3<Float>(0.34, 0.34, 0.34) : universalPrtDyeScale
         for i in 0..<81 {
             let lambda = Float(380 + i * 5)
             let scannerIllum = blackbodyNormalized(lambdaNM: lambda, kelvin: 5500.0)
-            let clampedDye = simd_max(rawPrtDye[i], zeroVec)
-            let balancedDye: SIMD3<Float> = clampedDye * prtDyeScale
+            let balancedDye: SIMD3<Float> = simd_max(rawPrtDye[i], zeroVec) * effPrtScale
             ptrPrtDye[i] = SIMD4<Float>(balancedDye.x, balancedDye.y, balancedDye.z, scannerIllum)
         }
     }
@@ -315,10 +327,21 @@ public final class MetalFilmRenderer {
         let pushGammaFactor: Float = powf(1.14, params.pushPullStops) * (1.0 + tempDelta) * params.agitationIntensity
         let fogOffset: Float = max(0.0, params.pushPullStops * 0.025 + tempDelta * 0.08)
 
+        // Pass the stock's true 3x3 DIR Interlayer Matrix, row-normalized to unit sum so neutral stays neutral
+        // while off-diagonal inhibition drives each film stock's signature color separation!
+        let m = negStock.dirInterlayerMatrix
         let cpl = params.dirCouplerAmount
-        let row0 = SIMD4<Float>(cpl, 0, 0, 0)
-        let row1 = SIMD4<Float>(0, cpl, 0, 0)
-        let row2 = SIMD4<Float>(0, 0, cpl, 0)
+        let r0Raw = SIMD3<Float>(1.0 + (m[0] - 1.0) * cpl, m[1] * cpl, m[2] * cpl)
+        let r1Raw = SIMD3<Float>(m[3] * cpl, 1.0 + (m[4] - 1.0) * cpl, m[5] * cpl)
+        let r2Raw = SIMD3<Float>(m[6] * cpl, m[7] * cpl, 1.0 + (m[8] - 1.0) * cpl)
+
+        let r0 = r0Raw / max(r0Raw.x + r0Raw.y + r0Raw.z, 0.1)
+        let r1 = r1Raw / max(r1Raw.x + r1Raw.y + r1Raw.z, 0.1)
+        let r2 = r2Raw / max(r2Raw.x + r2Raw.y + r2Raw.z, 0.1)
+
+        let row0 = SIMD4<Float>(r0.x, r0.y, r0.z, 0)
+        let row1 = SIMD4<Float>(r1.x, r1.y, r1.z, 0)
+        let row2 = SIMD4<Float>(r2.x, r2.y, r2.z, 0)
 
         let zeroVec3 = SIMD3<Float>(0.0, 0.0, 0.0)
         let effectiveHalationRGB: SIMD3<Float> = params.halationEnabled
@@ -330,14 +353,16 @@ public final class MetalFilmRenderer {
             ? (params.printExposureEV - params.exposureCompensationEV * 0.62)
             : params.printExposureEV
 
-        let totalYCC = params.dichroicYellowCC
-        let totalMCC = params.dichroicMagentaCC
+        // Include the film stock's + print stock's characteristic Enlarger Dichroic Y/M Color Balance Shift!
+        let totalYCC = params.dichroicYellowCC + negStock.defaultEnlargerYMShift.x + printStock.defaultEnlargerYMShift.x
+        let totalMCC = params.dichroicMagentaCC + negStock.defaultEnlargerYMShift.y + printStock.defaultEnlargerYMShift.y
         let totalCCC = params.dichroicCyanCC
 
         let preflashLin: Float = (params.preflashExposureEV > -5.9) ? powf(2.0, params.preflashExposureEV) : 0.0
         let callierQ: Float = (params.enlargerLightSource == .condenserPointSource) ? 1.15 : 1.0
 
-        let modeFlag: Int32 = negStock.isReversal ? 1 : (negStock.isMonochrome ? 2 : 0)
+        let modeFlag: Int32 = negStock.isReversal ? 1 : ((negStock.isMonochrome || printStock.isMonochrome) ? 2 : 0)
+        let meanToe: Float = (negStock.toeSoftnessRGB.x + negStock.toeSoftnessRGB.y + negStock.toeSoftnessRGB.z) * 0.333333
         self.frameCounter &+= 1
 
         return MetalFilmUniforms(
@@ -374,6 +399,7 @@ public final class MetalFilmRenderer {
             negativeGammaRGB: SIMD4<Float>(negStock.gammaRGB.x, negStock.gammaRGB.y, negStock.gammaRGB.z, 0),
             negativeDminRGB: SIMD4<Float>(negStock.dMinRGB.x, negStock.dMinRGB.y, negStock.dMinRGB.z, 0),
             negativeDmaxRGB: SIMD4<Float>(negStock.dMaxRGB.x, negStock.dMaxRGB.y, negStock.dMaxRGB.z, 0),
+            negativeToeShoulder: SIMD4<Float>(negStock.shoulderSoftnessRGB.x, negStock.shoulderSoftnessRGB.y, negStock.shoulderSoftnessRGB.z, meanToe),
             printGammaRGB: SIMD4<Float>(printStock.gammaRGB.x, printStock.gammaRGB.y, printStock.gammaRGB.z, 0),
             printDminRGB: SIMD4<Float>(printStock.dMinRGB.x, printStock.dMinRGB.y, printStock.dMinRGB.z, 0),
             printDmaxRGB: SIMD4<Float>(printStock.dMaxRGB.x, printStock.dMaxRGB.y, printStock.dMaxRGB.z, 0),

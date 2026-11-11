@@ -5,13 +5,16 @@
 //  Full Physical Optics, Sensitometry & Photochemical Darkroom Compute Pipeline
 //  Optimized for Apple A15 Bionic (iPhone 13 Pro Max 5-Core GPU, Unified 6GB LPDDR4X)
 //
-//  VERIFIED AGAINST REAL-DEVICE PHOTOS (IMG_4845..IMG_4861):
-//  1. Fixed Washed-Out Gray Veil (min ~0.22, p99 ~0.62 in IMG_4845..4855 and max ~0.51 in IMG_4857..4861):
-//     - Paired with Unit Optical Density Calibration in MetalFilmRenderer.swift (where D=1.0 produces exact T=10^-1=0.10),
-//       and anchored the RA-4 / 2383 Print H-D toe & shoulder so scene black (E=0.01) maps to sRGB 0.04 and scene white (E=0.98) maps to sRGB 0.94!
-//  2. Fixed Exact Lagrange First-Derivative Coefficient (`2.0f * (yR - yB)` instead of `4.0f * (yR - yB)`):
-//     - Previously `4.0f` doubled the linear slope toward 644nm Red, turning greens yellowish-brown and skewing colors.
-//     - Now Blue (444nm), Green (544nm), and Red (644nm) reconstruct their exact input linear tristimulus values to 4 decimal places!
+//  AUTHENTIC PER-STOCK DIFFERENTIATION & SENSITOMETRIC FIDELITY:
+//  1. Asymmetric Toe & Shoulder Hurter-Driffield Curve (`evaluate_hd_curve_asymmetric`):
+//     Uses each stock's `gammaRGB`, `shoulderSoftnessRGB`, and `toeSoftness` so Portra 160/400 have a soft pastel highlight roll-off,
+//     Ektar 100 & Velvia 50 have steep high-contrast S-curves, and Gold 200 has its characteristic lower blue-layer gamma (golden highlights).
+//  2. Full 3x3 DIR Interlayer Chemical Inhibition Matrix (`u.dirCouplerMatrixRow0/1/2`):
+//     Applies each stock's row-normalized 3x3 interlayer matrix directly to normalized layer densities, reproducing authentic
+//     cross-channel chemical inhibition (e.g., Fuji Pro 400H & Superia 400 cyan-green separation vs Kodak Ektar/Kodachrome red-cyan punch).
+//  3. Reference Span Scaling in Enlarger & Direct Scanner:
+//     Maps developed negative densities onto the universally calibrated darkroom enlarger so contrast and color balance shifts
+//     between stocks (and between Endura, Crystal Archive, Kodak 2383, Eterna 3513DI, and Ilford Multigrade print stocks) are immediately visible.
 //
 
 #include <metal_stdlib>
@@ -59,6 +62,7 @@ struct MetalFilmUniforms {
     float4 negativeGammaRGB;
     float4 negativeDminRGB;
     float4 negativeDmaxRGB;
+    float4 negativeToeShoulder; // .xyz = shoulderSoftnessRGB, .w = mean toeSoftness
     float4 printGammaRGB;
     float4 printDminRGB;
     float4 printDmaxRGB;
@@ -71,12 +75,6 @@ struct MetalFilmUniforms {
 
 // ============================================================================
 // Helper: Jakob & Hanika (Eurographics 2019) Exact Sigmoid & Lagrange Polynomial
-// s(x) = 0.5 + 0.5 * x / sqrt(1 + x^2)
-// Exact inverse: s^-1(y) = (y - 0.5) / sqrt(y(1 - y))
-// For uniform anchor spacing h = 0.25 at u0 = 0.16 (444nm), u1 = 0.41 (544nm), u2 = 0.66 (644nm):
-//   c0 = (yR - 2*yG + yB) / (2 * h^2) = 8.0 * (yR - 2*yG + yB)
-//   c1 = (yR - yB) / (2 * h) - (u0 + u2) * c0 = 2.0 * (yR - yB) - 0.82 * c0
-//   c2 = yG - u1^2 * c0 - u1 * c1 = yG - 0.1681 * c0 - 0.41 * c1
 // ============================================================================
 inline float jakob_hanika_sigmoid(float x) {
     return 0.5f + 0.5f * x * rsqrt(1.0f + x * x);
@@ -103,25 +101,35 @@ inline float3 compute_jakob_hanika_coeffs(float3 rgb_linear, thread float &albed
 }
 
 // ============================================================================
-// Helper: Smooth Hurter-Driffield (H-D) Sensitometric Characteristic Curve
+// Helper: Asymmetric Toe & Shoulder Hurter-Driffield (H-D) Characteristic Curve
+// Returns normalized density in [0, 1] before scaling by reference optical span (2.0)
 // ============================================================================
-inline float3 evaluate_hd_curve(
+inline float3 evaluate_hd_normalized(
     float3 logE,
-    float3 dMin,
-    float3 dMax,
     float3 gamma,
+    float3 shoulderSoftness,
+    float toeSoftness,
     bool isReversal
 ) {
-    float3 span = max(dMax - dMin, float3(0.1f));
     float3 x = logE + 0.7447f;
     if (isReversal) {
+        // Slide reversal films (Velvia 50, Provia 100F, E100, Kodachrome 64) have gamma ~1.5..1.9;
+        // scale by 0.50 so reversal gamma directly controls slide contrast around 0.80..0.95
         x = -x;
+        gamma *= 0.50f;
     }
-    // Normalized slope k ensures consistent straight-line latitude across all 3 emulsion layers
-    float3 k = 2.65f * gamma;
+    // Asymmetric compression in highlight shoulder (x > 0) vs shadow toe (x < 0)
+    float3 asym;
+    for (int i = 0; i < 3; ++i) {
+        if (x[i] >= 0.0f) {
+            asym[i] = 1.0f / (1.0f + 0.38f * shoulderSoftness[i] * x[i]);
+        } else {
+            asym[i] = 1.0f / (1.0f - 0.25f * toeSoftness * x[i]);
+        }
+    }
+    float3 k = 2.65f * gamma * asym;
     float3 expTerm = exp(-clamp(k * x, -16.0f, 16.0f));
-    float3 normalized = 1.0f / (1.0f + expTerm);
-    return dMin + span * normalized;
+    return 1.0f / (1.0f + expTerm);
 }
 
 // ============================================================================
@@ -149,7 +157,7 @@ inline float3 rand_gaussian3(uint2 gid, uint seed, uint layerIdx) {
 
 // ============================================================================
 // Stage 0: Bi-Planar YCbCr (8-bit Full Range OR 10-bit HLG Video Range) ->
-//          Scene-Linear RGB + Custom Log Encoding (Apple Log / ARRI LogC3 / Cineon)
+//          Scene-Linear RGB + Custom Log Encoding
 // ============================================================================
 inline float hlg_inverse_oetf(float e) {
     const float a = 0.17883277f;
@@ -342,7 +350,7 @@ kernel void kernel_halation_and_scatter(
             inExposure.read(uint2(halCoordG)).g,
             inExposure.read(uint2(halCoordB)).b
         );
-        float3 highlightGate = smoothstep(float3(0.45f), float3(1.8f), sampleHal);
+        float3 highlightGate = smoothstep(float3(0.40f), float3(1.6f), sampleHal);
         float3 wHal = float3(1.0f / (1.0f + 6.0f * frac * frac));
         halationAccum += sampleHal * highlightGate * wHal;
         halationWeightSum += wHal;
@@ -365,7 +373,7 @@ kernel void kernel_halation_and_scatter(
 }
 
 // ============================================================================
-// Stage 3: Hurter-Driffield Development, Push/Pull & Gentle DIR Couplers
+// Stage 3: Hurter-Driffield Development, Push/Pull & Full 3x3 DIR Coupler Matrix
 // ============================================================================
 kernel void kernel_develop_and_dir_couplers(
     texture2d<float, access::read> inScatteredExposure [[texture(0)]],
@@ -382,10 +390,10 @@ kernel void kernel_develop_and_dir_couplers(
 
     bool isReversal = (u.isReversalOrMono == 1);
     float3 effGamma = u.negativeGammaRGB.rgb * u.pushPullGammaScale;
-    float3 effDmin  = u.negativeDminRGB.rgb + float3(u.dminFogOffset);
-    float3 effDmax  = u.negativeDmaxRGB.rgb;
+    float3 shoulder = u.negativeToeShoulder.xyz;
+    float toe = u.negativeToeShoulder.w;
 
-    float3 dCenter = evaluate_hd_curve(logE, effDmin, effDmax, effGamma, isReversal);
+    float3 normCenter = evaluate_hd_normalized(logE, effGamma, shoulder, toe, isReversal);
 
     int rPx = max(int(round(u.dirRadiusPx)), 1);
     float3 expN = inScatteredExposure.read(uint2(clamp(int2(gid) + int2(0, -rPx), int2(0), int2(width-1, height-1)))).rgb;
@@ -393,26 +401,28 @@ kernel void kernel_develop_and_dir_couplers(
     float3 expE = inScatteredExposure.read(uint2(clamp(int2(gid) + int2( rPx, 0), int2(0), int2(width-1, height-1)))).rgb;
     float3 expW = inScatteredExposure.read(uint2(clamp(int2(gid) + int2(-rPx, 0), int2(0), int2(width-1, height-1)))).rgb;
 
-    float3 dN = evaluate_hd_curve(log10(max(expN, 1e-7f)), effDmin, effDmax, effGamma, isReversal);
-    float3 dS = evaluate_hd_curve(log10(max(expS, 1e-7f)), effDmin, effDmax, effGamma, isReversal);
-    float3 dE = evaluate_hd_curve(log10(max(expE, 1e-7f)), effDmin, effDmax, effGamma, isReversal);
-    float3 dW = evaluate_hd_curve(log10(max(expW, 1e-7f)), effDmin, effDmax, effGamma, isReversal);
+    float3 normN = evaluate_hd_normalized(log10(max(expN, 1e-7f)), effGamma, shoulder, toe, isReversal);
+    float3 normS = evaluate_hd_normalized(log10(max(expS, 1e-7f)), effGamma, shoulder, toe, isReversal);
+    float3 normE = evaluate_hd_normalized(log10(max(expE, 1e-7f)), effGamma, shoulder, toe, isReversal);
+    float3 normW = evaluate_hd_normalized(log10(max(expW, 1e-7f)), effGamma, shoulder, toe, isReversal);
 
-    float3 dSurround = 0.25f * (dN + dS + dE + dW);
-    float3 dNet = max(dCenter - effDmin, float3(0.0f));
-    float3 dLaplacian = dCenter - dSurround;
+    float3 normSurround = 0.25f * (normN + normS + normE + normW);
+    float3 normLaplacian = normCenter - normSurround;
 
-    float3 span = max(effDmax - effDmin, float3(0.1f));
-    float3 normNet = dNet / span;
-    float meanNorm = dot(normNet, float3(0.333333f));
-    float3 chromaDelta = normNet - float3(meanNorm);
+    // Apply Stock-Specific Row-Normalized 3x3 DIR Interlayer Inhibition Matrix + Eberhard Edge Micro-Contrast!
+    float3 normCoupled = float3(
+        dot(u.dirCouplerMatrixRow0.xyz, normCenter),
+        dot(u.dirCouplerMatrixRow1.xyz, normCenter),
+        dot(u.dirCouplerMatrixRow2.xyz, normCenter)
+    ) + 0.14f * normLaplacian;
 
-    // DIR Interlayer Chroma Purity Boost + Eberhard Edge Micro-Contrast
-    float3 normCoupled = float3(meanNorm) + chromaDelta * (1.0f + 0.25f * u.dirCouplerMatrixRow0.x);
-    float3 dCoupled = normCoupled * span + 0.22f * dLaplacian;
+    // Developer Exhaustion (compresses dense regions when developerExhaustion > 0)
+    float meanSurround = dot(normSurround, float3(0.333333f));
+    float exhFactor = 1.0f / (1.0f + 0.25f * u.developerExhaustion * max(meanSurround - 0.5f, 0.0f));
+    normCoupled = clamp(normCoupled * exhFactor + float3(u.dminFogOffset * 0.2f), 0.0f, 1.0f);
 
-    float3 finalDensityCMY = clamp(effDmin + dCoupled, effDmin, effDmax);
-    outNegativeDensityCMY.write(float4(finalDensityCMY, 1.0f), gid);
+    // Output developed net density scaled to the Universal Reference Optical Span (2.0)
+    outNegativeDensityCMY.write(float4(normCoupled * 2.0f, 1.0f), gid);
 }
 
 // ============================================================================
@@ -452,13 +462,14 @@ kernel void kernel_enlarger_print_and_grain(
         clamp(uint(normUV.y * float(srcH)), 0u, max(srcH, 1u) - 1u)
     );
 
-    float3 dNegCMY = inNegativeDensityCMY.read(srcCoord).rgb;
+    // netNegD is in [0.0, 2.0]
+    float3 netNegD = inNegativeDensityCMY.read(srcCoord).rgb;
 
     if (u.grainStrength > 0.001f) {
-        float3 netD = clamp((dNegCMY - u.negativeDminRGB.rgb) / max(u.negativeDmaxRGB.rgb - u.negativeDminRGB.rgb, float3(0.1f)), 0.0f, 1.0f);
-        float3 fastVar = netD * (1.0f - 0.65f * netD);
-        float3 midVar  = 4.0f * netD * (1.0f - netD);
-        float3 slowVar = netD * netD * (1.0f - 0.5f * pow(netD, float3(u.grainUniformity)));
+        float3 normD = clamp(netNegD * 0.5f, 0.0f, 1.0f);
+        float3 fastVar = normD * (1.0f - 0.65f * normD);
+        float3 midVar  = 4.0f * normD * (1.0f - normD);
+        float3 slowVar = normD * normD * (1.0f - 0.5f * pow(normD, float3(u.grainUniformity)));
 
         float3 nFast = rand_gaussian3(gid, u.frameSeed, 0u);
         float3 nMid  = rand_gaussian3(gid, u.frameSeed, 1u);
@@ -467,10 +478,10 @@ kernel void kernel_enlarger_print_and_grain(
         float areaScale = clamp(12.0f / max(u.pixelSizeMicrometers, 1.5f), 0.25f, 2.2f);
         float3 sigmaGrain = (u.rmsGranularityRGB.rgb * 0.0014f) * u.grainStrength * areaScale;
         float3 deltaD = sigmaGrain * (0.45f * sqrt(fastVar) * nFast + 0.38f * sqrt(midVar) * nMid + 0.17f * sqrt(slowVar) * nSlow);
-        dNegCMY = max(dNegCMY + deltaD, u.negativeDminRGB.rgb);
+        netNegD = clamp(netNegD + deltaD, 0.0f, 2.2f);
     }
 
-    float3 netNegD = max(dNegCMY - u.negativeDminRGB.rgb, float3(0.0f)) * u.callierQFactor;
+    netNegD *= u.callierQFactor;
 
     float3 netPrintOrScanDensity = float3(0.0f);
     bool isDirectScan = (u.printPipelineMode == 1) || (u.isReversalOrMono == 1);
@@ -485,7 +496,7 @@ kernel void kernel_enlarger_print_and_grain(
             float cLobe = exp(-0.5f * pow((lambda - 660.0f) / 48.0f, 2.0f));
             float mLobe = exp(-0.5f * pow((lambda - 548.0f) / 40.0f, 2.0f));
             float yLobe = exp(-0.5f * pow((lambda - 445.0f) / 35.0f, 2.0f));
-            float filterDensity = dot(u.dichroicFilterCMY.xyz * 0.008f, float3(cLobe, mLobe, yLobe));
+            float filterDensity = dot(u.dichroicFilterCMY.xyz * 0.0045f, float3(cLobe, mLobe, yLobe));
 
             float negSpectralDensity = dot(netNegD, negDyeIllum.xyz) + filterDensity;
             float transmittance = pow(10.0f, -clamp(negSpectralDensity, -2.0f, 4.5f));
@@ -504,26 +515,23 @@ kernel void kernel_enlarger_print_and_grain(
             pSlope *= vcMultiplier;
         }
 
-        // Shift print curve center by -0.16 logE so 18% middle gray (logPrintE = -0.7447) develops to netPrintD = 0.72
-        // (which under Unit Optical Density gives T = 10^-0.72 = 0.19 -> sRGB 0.47!),
-        // while scene highlights (logPrintE <= -1.45) clear the paper toe to netPrintD = 0.0 (crisp paper white sRGB 0.95+),
-        // and scene shadows (logPrintE >= -0.10) reach netPrintD = 2.1+ (deep rich blacks sRGB 0.04)!
         float3 xP = logPrintE + 0.7447f - 0.16f;
         float3 rawPrtD = spanP / (1.0f + exp(-clamp(pSlope * xP, -16.0f, 16.0f)));
         netPrintOrScanDensity = max(rawPrtD - float3(0.15f), float3(0.0f)) * 1.15f;
     } else {
         // DIRECT LAB SCANNER
         if (u.isReversalOrMono == 1) {
-            // Slide Reversal Film: already positive density; subtract D_min and clear highlight toe
-            netPrintOrScanDensity = max(netNegD - float3(0.12f), float3(0.0f)) * 1.12f;
+            // Slide Reversal Film: already positive density in [0.0, 2.0]
+            float3 normSlide = clamp(netNegD * 0.5f, 0.0f, 1.0f);
+            float3 stretched = clamp((normSlide - 0.12f) / 0.76f, 0.0f, 1.0f);
+            netPrintOrScanDensity = stretched * 2.25f;
         } else {
-            // Direct Negative Scan: invert normalized negative density per channel and expand toe/shoulder
-            float3 negSpan = max(u.negativeDmaxRGB.rgb - u.negativeDminRGB.rgb, float3(0.2f));
-            float3 normNeg = clamp(netNegD / negSpan, 0.0f, 1.0f);
-            // Stretch [0.14, 0.86] of the negative H-D curve across [0.0, 1.0] so direct scans have crisp whites and deep blacks!
+            // Direct Negative Scan: invert normalized negative density and apply stock YM tint
+            float3 normNeg = clamp(netNegD * 0.5f, 0.0f, 1.0f);
             float3 stretched = clamp((normNeg - 0.14f) / 0.72f, 0.0f, 1.0f);
             float3 invNorm = pow(1.0f - stretched, float3(1.10f * u.printGamma));
-            netPrintOrScanDensity = invNorm * float3(2.15f);
+            float3 tintOffset = float3(u.dichroicFilterCMY.x, u.dichroicFilterCMY.y, u.dichroicFilterCMY.z) * 0.008f;
+            netPrintOrScanDensity = max(invNorm * 2.15f + tintOffset, float3(0.0f));
         }
     }
 
