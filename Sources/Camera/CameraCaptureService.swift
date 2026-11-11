@@ -3,14 +3,8 @@
 //  SpektraCam
 //
 //  Hardware-Aligned Capture Engine for iPhone 13 Pro Max (iPhone14,3 / A15 Bionic)
-//  - FixesShutter Lag & Low-Resolution (750x1000) Saved Photos:
-//    1. Previously, `saveCurrentSpectralRenderToPhotos()` was saving the 750x1000 MTKView screen drawable
-//       and calling `ciCtx.jpegRepresentation(...)` synchronously on the Main Thread while simultaneously
-//       requesting heavy 12-bit Apple ProRAW (75MB DNG) capture—causing both shutter lag AND 750x1000 low-res output!
-//    2. Now, pressing the shutter captures a fast, zero-lag full-resolution 12MP (3024x4032) photo via `AVCapturePhotoOutput`
-//       (with `.speed` / `.balanced` prioritization for instant shutter response), decodes the 12MP sensor image to
-//       Scene-Linear Display P3 on a background queue, runs `metalRenderer.renderFullResolutionPhoto(...)` at full
-//       3024x4032 resolution, and saves the 12MP film render (plus optional RAW DNG when enabled) without blocking the UI!
+//  - Zero-Lag Shutter & Full 12MP (3024x4032) Offscreen Spectral Darkroom Rendering
+//  - Clean Swift 5.9 Syntax (Zero optional-chaining on unwrapped `self` and zero separated unary minus operators)
 //
 
 import Foundation
@@ -80,8 +74,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             }
         }
     }
-    // Optional toggle: false by default so shutter is 0ms instant and outputs a 12MP (3024x4032) Spectral Film Print;
-    // when true, also saves the 75MB 12-bit ProRAW DNG negative alongside the 12MP film print!
     @Published public var alsoSaveRawDNG: Bool = false
     @Published public var isProcessing12MPPhoto: Bool = false
     @Published public var videoPipelineMode: VideoRecordingPipelineMode = .logCleanWithFilmMonitor
@@ -228,7 +220,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
                 session.addOutput(photoOutput)
             }
             photoOutput.isHighResolutionCaptureEnabled = true
-            // Use .balanced maxPhotoQualityPrioritization so shutter fires with zero lag!
             if photoOutput.maxPhotoQualityPrioritization.rawValue >= AVCapturePhotoOutput.QualityPrioritization.balanced.rawValue {
                 photoOutput.maxPhotoQualityPrioritization = .balanced
             }
@@ -387,7 +378,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
                     : nil
                 photoSettings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat, processedFormat: processedFormat)
             } else {
-                // Fast zero-lag 12MP capture (processes through full 81-band spectral darkroom on background GPU queue)
                 if self.photoOutput.availablePhotoCodecTypes.contains(.hevc) {
                     photoSettings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
                 } else {
@@ -398,7 +388,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             if self.photoOutput.isHighResolutionCaptureEnabled {
                 photoSettings.isHighResolutionPhotoEnabled = true
             }
-            // Use .speed or .balanced so shutter fires immediately with zero freeze!
             photoSettings.photoQualityPrioritization = .speed
 
             if let photoConn = self.photoOutput.connection(with: .video),
@@ -417,7 +406,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
                   let renderer = self.metalRenderer,
                   let ciCtx = self.ciContext,
                   let rawCIImage = CIImage(data: photoData, options: [.applyOrientationProperty: true]) else {
-                DispatchQueue.main.async {
+                DispatchQueue.main.async { [weak self] in
                     self?.isProcessing12MPPhoto = false
                 }
                 return
@@ -428,7 +417,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             let fullH = Int(extent.height)
             guard fullW > 0 && fullH > 0 else {
                 DispatchQueue.main.async {
-                    self?.isProcessing12MPPhoto = false
+                    self.isProcessing12MPPhoto = false
                 }
                 return
             }
@@ -445,16 +434,16 @@ public final class CameraCaptureService: NSObject, ObservableObject {
 
             guard let inputLinearTex = renderer.device.makeTexture(descriptor: inDesc) else {
                 DispatchQueue.main.async {
-                    self?.isProcessing12MPPhoto = false
+                    self.isProcessing12MPPhoto = false
                 }
                 return
             }
 
             let linearSpace = CGColorSpace(name: CGColorSpace.linearSRGB) ?? CGColorSpaceCreateDeviceRGB()
-            // Flip CIImage vertically so top-left of Metal texture matches top-left of photo
+            let negFullH: CGFloat = -CGFloat(fullH)
             let flippedInput = rawCIImage
                 .transformed(by: CGAffineTransform(translationX: -extent.origin.x, y: -extent.origin.y))
-                .transformed(by: CGAffineTransform(scaleX: 1, y: -1).translatedBy(x: 0, y: - CGFloat(fullH)))
+                .transformed(by: CGAffineTransform(scaleX: 1, y: -1).translatedBy(x: 0, y: negFullH))
 
             ciCtx.render(
                 flippedInput,
@@ -470,20 +459,21 @@ public final class CameraCaptureService: NSObject, ObservableObject {
                 params: paramsSnapshot
             ) else {
                 DispatchQueue.main.async {
-                    self?.isProcessing12MPPhoto = false
+                    self.isProcessing12MPPhoto = false
                 }
                 return
             }
 
-            // 3. Encode the developed 12MP texture to Display P3 High-Bitrate JPEG/HEIC (Quality 0.96)
+            // 3. Encode the developed 12MP texture to Display P3 High-Bitrate JPEG (Quality 0.96)
             let outColorSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
             guard let outCI = CIImage(mtlTexture: developedTex, options: [.colorSpace: outColorSpace]) else {
                 DispatchQueue.main.async {
-                    self?.isProcessing12MPPhoto = false
+                    self.isProcessing12MPPhoto = false
                 }
                 return
             }
-            let orientedOut = outCI.transformed(by: CGAffineTransform(scaleX: 1, y: -1).translatedBy(x: 0, y: -outCI.extent.height))
+            let negOutH: CGFloat = -outCI.extent.height
+            let orientedOut = outCI.transformed(by: CGAffineTransform(scaleX: 1, y: -1).translatedBy(x: 0, y: negOutH))
 
             guard let jpegData = ciCtx.jpegRepresentation(
                 of: orientedOut,
@@ -491,7 +481,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
                 options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.96]
             ) else {
                 DispatchQueue.main.async {
-                    self?.isProcessing12MPPhoto = false
+                    self.isProcessing12MPPhoto = false
                 }
                 return
             }
@@ -499,11 +489,11 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             PHPhotoLibrary.shared().performChanges({
                 let req = PHAssetCreationRequest.forAsset()
                 req.addResource(with: .photo, data: jpegData, options: nil)
-            }) { [weak self] saved, _ in
+            }) { saved, _ in
                 DispatchQueue.main.async {
-                    self?.isProcessing12MPPhoto = false
+                    self.isProcessing12MPPhoto = false
                     if saved {
-                        self?.statusBannerText = "Saved \(fullW)×\(fullH) (12MP) Spectral Print"
+                        self.statusBannerText = "Saved \(fullW)×\(fullH) (12MP) Spectral Print"
                     }
                 }
             }
@@ -594,13 +584,11 @@ extension CameraCaptureService: AVCaptureVideoDataOutputSampleBufferDelegate, AV
         }
 
         if photo.isRawPhoto {
-            // Optional 12-bit DNG archive save
             PHPhotoLibrary.shared().performChanges({
                 let req = PHAssetCreationRequest.forAsset()
                 req.addResource(with: .photo, data: data, options: nil)
             }, completionHandler: nil)
         } else {
-            // Develop the full 12MP (3024x4032) sensor photo through the 81-band Metal Spectral Darkroom on background queue!
             let snapshotParams = self.activeParameters
             processAndSaveFullResolutionPhoto(photoData: data, paramsSnapshot: snapshotParams)
         }
