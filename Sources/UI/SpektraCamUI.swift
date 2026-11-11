@@ -3,18 +3,14 @@
 //  SpektraCam
 //
 //  Native Darkroom UI & ProMotion MetalKit Viewfinder for iPhone 13 Pro Max (6.7" 428x926 pt)
-//  - Zero-Lag Slider Architecture:
-//      `MetalFilmViewfinder` reads `cameraService.activeParameters` directly inside `draw(in:)` without
-//      taking a SwiftUI `@Binding`, so dragging sliders never triggers `updateUIView` or re-creates
-//      the MTKView bridge!
-//  - Exposes ALL darkroom parameters (including Enlarger Light Source, Print Gamma Contrast, B&W Multigrade Grade)
+//  - Zero-Lag Shutter & 12MP (3024x4032) Full-Resolution Output
+//  - Optional "+DNG" toggle on the Exposure tab if the user also wants the raw 75MB DNG negative saved alongside the 12MP film print
 //
 
 import SwiftUI
 import MetalKit
 import CoreVideo
 
-// MARK: - ProMotion MetalKit Real-Time Spectral Viewfinder (Decoupled from SwiftUI Slider Re-renders)
 public struct MetalFilmViewfinder: UIViewRepresentable {
     @ObservedObject var cameraService: CameraCaptureService
 
@@ -36,9 +32,7 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
         return mtkView
     }
 
-    public func updateUIView(_ uiView: MTKView, context: Context) {
-        // Intentionally lightweight: parameters are read directly from cameraService.activeParameters in draw(in:)
-    }
+    public func updateUIView(_ uiView: MTKView, context: Context) {}
 
     public final class Coordinator: NSObject, MTKViewDelegate {
         let cameraService: CameraCaptureService
@@ -67,20 +61,18 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
             let liveParams = cameraService.activeParameters
             let liveLogCurve = cameraService.logTransferCurve
 
-            if let result = renderer.processVideoSampleBuffer(
+            if renderer.processVideoSampleBuffer(
                 pixelBuffer: pb,
                 params: liveParams,
                 logCurve: liveLogCurve,
                 outputDrawableTexture: drawable.texture
-            ) {
-                cameraService.updateLatestRenderedTexture(result.filmRenderedTexture)
+            ) != nil {
                 drawable.present()
             }
         }
     }
 }
 
-// MARK: - Darkroom Parameter Drawer Tabs
 public enum DarkroomInspectorTab: String, CaseIterable, Identifiable {
     case exposure = "① Exposure"
     case optics   = "② Bloom"
@@ -93,7 +85,6 @@ public enum DarkroomInspectorTab: String, CaseIterable, Identifiable {
     public var id: String { rawValue }
 }
 
-// MARK: - Main Darkroom Camera View (Optimized for iPhone 13 Pro Max 428x926 pt)
 public struct SpektraCamMainView: View {
     @StateObject private var cameraService = CameraCaptureService()
     @State private var params = FilmSimulationParameters()
@@ -107,10 +98,8 @@ public struct SpektraCamMainView: View {
             Color.black.ignoresSafeArea()
 
             VStack(spacing: 6) {
-                // 1. Top Telemetry Bar
                 topTelemetryHeader
 
-                // 2. Real-Time Metal Spectral Viewfinder (Decoupled from @State params for 0ms slider response!)
                 ZStack(alignment: .bottomLeading) {
                     MetalFilmViewfinder(cameraService: cameraService)
                         .aspectRatio(cameraService.isCaptureModeVideo ? (16.0 / 9.0) : (3.0 / 4.0), contentMode: .fit)
@@ -145,10 +134,8 @@ public struct SpektraCamMainView: View {
                     .padding(10)
                 }
 
-                // 3. Film Canister & Print Paper Carousel
                 filmAndPrintCarousel
 
-                // 4. 7-Module Physical Darkroom Parameter Drawer
                 if showDarkroomDrawer {
                     darkroomParameterDrawer
                         .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -156,7 +143,6 @@ public struct SpektraCamMainView: View {
 
                 Spacer(minLength: 0)
 
-                // 5. Shutter, Capture Mode & Dual-Track Log Controls
                 bottomShutterDeck
             }
             .padding(.horizontal, 10)
@@ -184,7 +170,7 @@ public struct SpektraCamMainView: View {
                     .lineLimit(1)
                 Text(cameraService.statusBannerText)
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundColor(.gray)
+                    .foregroundColor(cameraService.isProcessing12MPPhoto ? .yellow : .gray)
                     .lineLimit(1)
             }
             Spacer()
@@ -290,6 +276,8 @@ public struct SpektraCamMainView: View {
                     case .exposure:
                         paramSlider(title: "Negative Exposure EV", value: $params.exposureCompensationEV, range: -4.0...4.0, unit: "EV")
                         Toggle("Auto Print EV Compensation", isOn: $params.autoPrintExposureComp)
+                            .font(.system(size: 11, design: .monospaced))
+                        Toggle("Also Save Raw 12-Bit DNG Negative", isOn: $cameraService.alsoSaveRawDNG)
                             .font(.system(size: 11, design: .monospaced))
                         paramSlider(title: "Optical Vignetting (cos⁴θ)", value: $params.opticalVignettingStrength, range: 0.0...1.0, unit: "")
                         paramSlider(title: "Scene Color Temp", value: $params.sceneIlluminantKelvin, range: 2800...9000, unit: "K")
@@ -411,7 +399,7 @@ public struct SpektraCamMainView: View {
                 Button {
                     cameraService.isCaptureModeVideo.toggle()
                 } label: {
-                    Text(cameraService.isCaptureModeVideo ? "LOG VIDEO" : "12-BIT RAW")
+                    Text(cameraService.isCaptureModeVideo ? "LOG VIDEO" : "12MP FILM")
                         .font(.system(size: 11, weight: .bold, design: .monospaced))
                         .foregroundColor(.black)
                         .padding(.horizontal, 12)
@@ -435,6 +423,7 @@ public struct SpektraCamMainView: View {
                             .fill(cameraService.isCaptureModeVideo ? Color.red : Color.orange)
                             .frame(width: cameraService.isRecordingVideo ? 30 : 52,
                                    height: cameraService.isRecordingVideo ? 30 : 52)
+                            .opacity(cameraService.isProcessing12MPPhoto ? 0.65 : 1.0)
                             .animation(.easeInOut(duration: 0.2), value: cameraService.isRecordingVideo)
                     }
                 }
