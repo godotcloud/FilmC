@@ -5,13 +5,13 @@
 //  Full Physical Optics, Sensitometry & Photochemical Darkroom Compute Pipeline
 //  Optimized for Apple A15 Bionic (iPhone 13 Pro Max 5-Core GPU, Unified 6GB LPDDR4X)
 //
-//  UPGRADED FOR ZERO-LAG 60FPS & RESPONSIVE BLOOM / HALATION / FILM CONTROLS:
-//  1. Stage 0 (`kernel_ycbcr10_to_scene_linear_and_log`) now bilinearly downsamples full-sensor YCbCr planes
-//     directly into the 960x1280 working texture, cutting 81-band compute load by 4x for zero slider lag!
-//  2. Stage 2 (`kernel_halation_and_scatter`) now computes perceptual highlight energy and adds both wide-radius
-//     optical diffusion (Black Pro-Mist / Glimmerglass / Spherical Soft Lens halation & mist lift) AND
-//     base-reflected red-orange Halation so adjusting Bloom Strength, Bloom Cutoff, Scatter Radius, or Halation
-//     produces an immediate, unmistakable cinematic glow!
+//  KEY A15 HARDWARE OPTIMIZATIONS:
+//  1. Single-cycle hardware SFU `exp2(-3.321928095f * D)` replaces `pow(10.0f, -D)` across all 81-band Beer-Lambert loops.
+//  2. Enlarger C/M/Y dichroic filter transmittance lobes are pre-baked into the 81-band enlarger spectrum buffer on CPU,
+//     eliminating 243 transcendental `exp()` evaluations per pixel in Stage 4.
+//  3. Unified scene-linear calibration across 10-bit video-range (`x420`) and 8-bit full/video-range inputs so switching
+//     between 12MP Photo and Log Video modes maintains identical exposure at 0.00 EV.
+//  4. Dedicated aspect-fit bilinear presentation & video-recording output kernel (`kernel_present_or_record_bgra8`).
 //
 
 #include <metal_stdlib>
@@ -69,6 +69,12 @@ struct MetalFilmUniforms {
     float bwMultigradeGrade;
     float padding0;
 };
+
+constant float LOG2_10 = 3.321928095f;
+
+inline float exp10_neg(float d) {
+    return exp2(-LOG2_10 * d);
+}
 
 inline float jakob_hanika_sigmoid(float x) {
     return 0.5f + 0.5f * x * rsqrt(1.0f + x * x);
@@ -139,18 +145,6 @@ inline float3 rand_gaussian3(uint2 gid, uint seed, uint layerIdx) {
     return sqrt(-2.0f * log(u1)) * cos(u2);
 }
 
-inline float hlg_inverse_oetf(float e) {
-    const float a = 0.17883277f;
-    const float b = 0.28466892f;
-    const float c = 0.55991073f;
-    e = clamp(e, 0.0f, 1.0f);
-    if (e <= 0.5f) {
-        return (e * e) / 3.0f;
-    } else {
-        return (exp((e - c) / a) + b) / 12.0f;
-    }
-}
-
 inline float srgb_to_linear(float v) {
     v = clamp(v, 0.0f, 1.0f);
     return (v <= 0.04045f) ? (v / 12.92f) : pow((v + 0.055f) / 1.055f, 2.4f);
@@ -190,7 +184,7 @@ inline float3 encode_custom_log(float3 linearRGB, int logMode) {
     } else {
         const float refBlack = 95.0f / 1023.0f;
         const float refWhite = 685.0f / 1023.0f;
-        float offset = pow(10.0f, (refBlack - refWhite) * (1023.0f / 300.0f) * 0.6f);
+        float offset = exp2((refBlack - refWhite) * (1023.0f / 300.0f) * 0.6f * LOG2_10);
         float3 v = max(x, float3(0.0f)) * (1.0f - offset) + offset;
         return clamp(refWhite + (log10(v) / (0.6f * (1023.0f / 300.0f))), 0.0f, 1.0f);
     }
@@ -198,6 +192,7 @@ inline float3 encode_custom_log(float3 linearRGB, int logMode) {
 
 // ============================================================================
 // Stage 0: Resolution-Adaptive YCbCr -> Scene-Linear + Log
+// Unified exposure calibration between 10-bit video-range and 8-bit full-range
 // ============================================================================
 kernel void kernel_ycbcr10_to_scene_linear_and_log(
     texture2d<float, access::read> lumaPlane [[texture(0)]],
@@ -228,19 +223,20 @@ kernel void kernel_ycbcr10_to_scene_linear_and_log(
 
     float3 sceneLinear;
     if (is10BitInput != 0) {
+        // 10-bit video range [64..940]/1023 -> normalized [0..1] with identical scene-linear mid-grey as 8-bit photo preview
         float Y  = clamp((ySample - 0.0625f) * (1.0f / 0.85546875f), 0.0f, 1.0f);
         float Cb = (cbcrSample.r - 0.5f) * (1.0f / 0.875f);
         float Cr = (cbcrSample.g - 0.5f) * (1.0f / 0.875f);
 
-        float R_p = clamp(Y + 1.4746f * Cr, 0.0f, 1.0f);
-        float G_p = clamp(Y - 0.16455f * Cb - 0.57135f * Cr, 0.0f, 1.0f);
-        float B_p = clamp(Y + 1.8814f * Cb, 0.0f, 1.0f);
+        float R_p = clamp(Y + 1.4020f * Cr, 0.0f, 1.0f);
+        float G_p = clamp(Y - 0.344136f * Cb - 0.714136f * Cr, 0.0f, 1.0f);
+        float B_p = clamp(Y + 1.7720f * Cb, 0.0f, 1.0f);
 
         sceneLinear = float3(
-            hlg_inverse_oetf(R_p),
-            hlg_inverse_oetf(G_p),
-            hlg_inverse_oetf(B_p)
-        ) * 3.8f;
+            srgb_to_linear(R_p),
+            srgb_to_linear(G_p),
+            srgb_to_linear(B_p)
+        );
     } else {
         float Y  = ySample;
         float Cb = cbcrSample.r - 0.5f;
@@ -293,11 +289,10 @@ kernel void kernel_spectral_upsample_and_expose(
     for (int i = 0; i < 81; ++i) {
         float u_lambda = float(i) * (1.0f / 80.0f);
         float poly = (coeffs.x * u_lambda + coeffs.y) * u_lambda + coeffs.z;
-        float reflectance = jakob_hanika_sigmoid(poly) * albedoScale;
-
-        float4 sensIllum = spectralSensitivityTable[i];
-        rawExposure += reflectance * sensIllum.xyz;
+        float reflectance = jakob_hanika_sigmoid(poly);
+        rawExposure += reflectance * spectralSensitivityTable[i].xyz;
     }
+    rawExposure *= albedoScale;
 
     outEmulsionExposure.write(float4(max(rawExposure, float3(1e-7f)), 1.0f), gid);
 }
@@ -318,6 +313,15 @@ kernel void kernel_halation_and_scatter(
 
     float3 centerExp = inExposure.read(gid).rgb;
 
+    bool needScatter = (u.inEmulsionScatterPx > 0.2f);
+    bool needHalation = (dot(u.halationStrengthRGB.rgb, float3(1.0f)) > 1e-4f);
+    bool needBloom = (u.bloomStrength > 1e-4f);
+
+    if (!needScatter && !needHalation && !needBloom) {
+        outScatteredExposure.write(float4(max(centerExp, float3(1e-7f)), 1.0f), gid);
+        return;
+    }
+
     float3 scatterAccum = centerExp;
     float3 halationAccum = float3(0.0f);
     float3 bloomAccum = float3(0.0f);
@@ -325,14 +329,12 @@ kernel void kernel_halation_and_scatter(
     float3 halationWeightSum = float3(1e-5f);
     float bloomWeightSum = 1e-5f;
 
-    // Convert Bloom Cutoff (0.2..1.5 perceptual slider) into linear exposure threshold (0.04..0.85)
-    // so bright windows, lamps, screens, and white objects immediately trigger visible Pro-Mist glow!
     float linearBloomCutoff = pow(clamp(u.bloomThreshold * 0.65f, 0.05f, 1.2f), 2.0f);
     float bloomRadPx = clamp(u.bloomRadiusPx, 2.0f, 120.0f);
     float3 halRadPx = clamp(u.halationRadiusPxRGB.xyz, float3(2.0f), float3(140.0f));
     float scatRadPx = clamp(u.inEmulsionScatterPx, 0.0f, 18.0f);
 
-    const int NUM_TAPS = 16;
+    const int NUM_TAPS = 12;
     const float GOLDEN_ANGLE = 2.39996323f;
 
     for (int i = 1; i <= NUM_TAPS; ++i) {
@@ -340,42 +342,43 @@ kernel void kernel_halation_and_scatter(
         float angle = float(i) * GOLDEN_ANGLE;
         float2 dir = float2(cos(angle), sin(angle));
 
-        // 1. Frieser In-Emulsion Scatter
-        int2 scatterCoord = clamp(int2(gid) + int2(round(dir * frac * scatRadPx)), int2(0), int2(width - 1, height - 1));
-        float wScatter = exp(-2.0f * frac);
-        scatterAccum += inExposure.read(uint2(scatterCoord)).rgb * wScatter;
-        scatterWeightSum += wScatter;
+        if (needScatter) {
+            int2 scatterCoord = clamp(int2(gid) + int2(round(dir * frac * scatRadPx)), int2(0), int2(width - 1, height - 1));
+            float wScatter = exp(-2.0f * frac);
+            scatterAccum += inExposure.read(uint2(scatterCoord)).rgb * wScatter;
+            scatterWeightSum += wScatter;
+        }
 
-        // 2. Anti-Halation Base Reflection (Red/Green/Blue Layer-Specific Halo)
-        int2 halCoordR = clamp(int2(gid) + int2(round(dir * frac * halRadPx.x)), int2(0), int2(width - 1, height - 1));
-        int2 halCoordG = clamp(int2(gid) + int2(round(dir * frac * halRadPx.y)), int2(0), int2(width - 1, height - 1));
-        int2 halCoordB = clamp(int2(gid) + int2(round(dir * frac * halRadPx.z)), int2(0), int2(width - 1, height - 1));
+        if (needHalation) {
+            int2 halCoordR = clamp(int2(gid) + int2(round(dir * frac * halRadPx.x)), int2(0), int2(width - 1, height - 1));
+            int2 halCoordG = clamp(int2(gid) + int2(round(dir * frac * halRadPx.y)), int2(0), int2(width - 1, height - 1));
+            int2 halCoordB = clamp(int2(gid) + int2(round(dir * frac * halRadPx.z)), int2(0), int2(width - 1, height - 1));
 
-        float3 sampleHal = float3(
-            inExposure.read(uint2(halCoordR)).r,
-            inExposure.read(uint2(halCoordG)).g,
-            inExposure.read(uint2(halCoordB)).b
-        );
-        // Gate highlights starting from linear 0.18 so high-contrast edges and bright objects show authentic red halation
-        float3 highlightGate = smoothstep(float3(0.16f), float3(0.85f), sampleHal);
-        float3 wHal = float3(1.0f / (1.0f + 5.0f * frac * frac));
-        halationAccum += sampleHal * highlightGate * wHal * 2.2f;
-        halationWeightSum += wHal;
+            float3 sampleHal = float3(
+                inExposure.read(uint2(halCoordR)).r,
+                inExposure.read(uint2(halCoordG)).g,
+                inExposure.read(uint2(halCoordB)).b
+            );
+            float3 highlightGate = smoothstep(float3(0.16f), float3(0.85f), sampleHal);
+            float3 wHal = float3(1.0f / (1.0f + 5.0f * frac * frac));
+            halationAccum += sampleHal * highlightGate * wHal * 2.2f;
+            halationWeightSum += wHal;
+        }
 
-        // 3. Optical Diffusion / Black Pro-Mist / Glimmerglass Bloom
-        int2 bloomCoord = clamp(int2(gid) + int2(round(dir * frac * bloomRadPx)), int2(0), int2(width - 1, height - 1));
-        float3 sampleBloom = inExposure.read(uint2(bloomCoord)).rgb;
-        float peakChannel = max(max(sampleBloom.r, sampleBloom.g), sampleBloom.b);
-        float bloomGate = smoothstep(linearBloomCutoff * 0.45f, linearBloomCutoff * 1.45f, peakChannel);
-        float wBloom = exp(-1.6f * frac * frac);
-        // Black Pro-Mist both scatters highlights AND gently lifts adjacent midtone/shadow contrast
-        bloomAccum += (sampleBloom * bloomGate * 2.8f + sampleBloom * 0.25f) * wBloom;
-        bloomWeightSum += wBloom;
+        if (needBloom) {
+            int2 bloomCoord = clamp(int2(gid) + int2(round(dir * frac * bloomRadPx)), int2(0), int2(width - 1, height - 1));
+            float3 sampleBloom = inExposure.read(uint2(bloomCoord)).rgb;
+            float peakChannel = max(max(sampleBloom.r, sampleBloom.g), sampleBloom.b);
+            float bloomGate = smoothstep(linearBloomCutoff * 0.45f, linearBloomCutoff * 1.45f, peakChannel);
+            float wBloom = exp(-1.6f * frac * frac);
+            bloomAccum += (sampleBloom * bloomGate * 2.8f + sampleBloom * 0.25f) * wBloom;
+            bloomWeightSum += wBloom;
+        }
     }
 
     float3 scattered = scatterAccum / scatterWeightSum;
-    float3 halationSignal = (halationAccum / halationWeightSum) * u.halationStrengthRGB.rgb;
-    float3 bloomSignal = (bloomAccum / bloomWeightSum) * u.bloomStrength;
+    float3 halationSignal = needHalation ? ((halationAccum / halationWeightSum) * u.halationStrengthRGB.rgb) : float3(0.0f);
+    float3 bloomSignal = needBloom ? ((bloomAccum / bloomWeightSum) * u.bloomStrength) : float3(0.0f);
 
     float3 finalExposure = max(scattered + halationSignal + bloomSignal, float3(1e-7f));
     outScatteredExposure.write(float4(finalExposure, 1.0f), gid);
@@ -432,7 +435,9 @@ kernel void kernel_develop_and_dir_couplers(
 }
 
 // ============================================================================
-// Stage 4: Virtual Enlarger, RA-4 / 2383 Print, Grain & Full-Contrast Display Output
+// Stage 4: Virtual Enlarger, RA-4 / 2383 Print, Grain & CIE 1931 Output
+// Dichroic C/M/Y filter transmittance is pre-multiplied into printSensTable[i].xyz
+// on the CPU, and scanner illuminant is pre-multiplied into cie1931XYZTable[i].xyz!
 // ============================================================================
 kernel void kernel_enlarger_print_and_grain(
     texture2d<float, access::read> inNegativeDensityCMY [[texture(0)]],
@@ -451,22 +456,27 @@ kernel void kernel_enlarger_print_and_grain(
     uint srcW = inNegativeDensityCMY.get_width();
     uint srcH = inNegativeDensityCMY.get_height();
 
-    float dstAspect = float(dstW) / float(max(dstH, 1u));
-    float srcAspect = float(srcW) / float(max(srcH, 1u));
-    float2 normUV = (float2(gid) + 0.5f) / float2(float(max(dstW, 1u)), float(max(dstH, 1u)));
-
-    if (dstAspect > srcAspect) {
-        float scaleY = srcAspect / dstAspect;
-        normUV.y = (normUV.y - 0.5f) * scaleY + 0.5f;
+    uint2 srcCoord;
+    if (dstW == srcW && dstH == srcH) {
+        srcCoord = gid;
     } else {
-        float scaleX = dstAspect / srcAspect;
-        normUV.x = (normUV.x - 0.5f) * scaleX + 0.5f;
-    }
+        float dstAspect = float(dstW) / float(max(dstH, 1u));
+        float srcAspect = float(srcW) / float(max(srcH, 1u));
+        float2 normUV = (float2(gid) + 0.5f) / float2(float(max(dstW, 1u)), float(max(dstH, 1u)));
 
-    uint2 srcCoord = uint2(
-        clamp(uint(normUV.x * float(srcW)), 0u, max(srcW, 1u) - 1u),
-        clamp(uint(normUV.y * float(srcH)), 0u, max(srcH, 1u) - 1u)
-    );
+        if (dstAspect > srcAspect) {
+            float scaleY = srcAspect / dstAspect;
+            normUV.y = (normUV.y - 0.5f) * scaleY + 0.5f;
+        } else {
+            float scaleX = dstAspect / srcAspect;
+            normUV.x = (normUV.x - 0.5f) * scaleX + 0.5f;
+        }
+
+        srcCoord = uint2(
+            clamp(uint(normUV.x * float(srcW)), 0u, max(srcW, 1u) - 1u),
+            clamp(uint(normUV.y * float(srcH)), 0u, max(srcH, 1u) - 1u)
+        );
+    }
 
     float3 netNegD = inNegativeDensityCMY.read(srcCoord).rgb;
 
@@ -494,19 +504,11 @@ kernel void kernel_enlarger_print_and_grain(
     if (!isDirectScan) {
         float3 printExposureRGB = float3(0.0f);
         for (int i = 0; i < 81; ++i) {
-            float4 negDyeIllum = negDyeAndEnlargerTable[i];
-            float lambda = 380.0f + float(i) * 5.0f;
-
-            float cLobe = exp(-0.5f * pow((lambda - 660.0f) / 48.0f, 2.0f));
-            float mLobe = exp(-0.5f * pow((lambda - 548.0f) / 40.0f, 2.0f));
-            float yLobe = exp(-0.5f * pow((lambda - 445.0f) / 35.0f, 2.0f));
-            float filterDensity = dot(u.dichroicFilterCMY.xyz * 0.0045f, float3(cLobe, mLobe, yLobe));
-
-            float negSpectralDensity = dot(netNegD, negDyeIllum.xyz) + filterDensity;
-            float transmittance = pow(10.0f, -clamp(negSpectralDensity, -2.0f, 4.5f));
-
-            float4 printSens = printSensTable[i];
-            printExposureRGB += (negDyeIllum.w * transmittance) * printSens.xyz;
+            float3 negDye = negDyeAndEnlargerTable[i].xyz;
+            float negSpectralDensity = dot(netNegD, negDye);
+            float transmittance = exp10_neg(clamp(negSpectralDensity, 0.0f, 4.5f));
+            // printSensTable[i].xyz already incorporates enlargerIllum * filterTransmittance
+            printExposureRGB += transmittance * printSensTable[i].xyz;
         }
 
         printExposureRGB = printExposureRGB * u.printExposureScale + float3(u.preflashLinearAddition);
@@ -544,13 +546,11 @@ kernel void kernel_enlarger_print_and_grain(
     float3 cieXYZ = float3(0.0f);
     for (int i = 0; i < 81; ++i) {
         float4 dyeScan = printDyeAndScannerTable[i];
-        float3 cleanDye = max(dyeScan.xyz, float3(0.0f));
-        float spectralD = dot(netPrintOrScanDensity, cleanDye);
-        float transmittance = pow(10.0f, -clamp(spectralD, 0.0f, 4.5f));
-        transmittance = clamp(transmittance + u.scannerGlare, 0.0f, 1.0f);
+        float spectralD = dot(netPrintOrScanDensity, dyeScan.xyz);
+        float transmittance = clamp(exp10_neg(clamp(spectralD, 0.0f, 4.5f)) + u.scannerGlare, 0.0f, 1.0f);
 
-        float3 cmf = cie1931XYZTable[i].xyz;
-        cieXYZ += (dyeScan.w * transmittance) * cmf;
+        float3 weightedCMF = cie1931XYZTable[i].xyz * dyeScan.w;
+        cieXYZ += transmittance * weightedCMF;
     }
 
     float3 linearOut;
@@ -599,4 +599,37 @@ kernel void kernel_enlarger_print_and_grain(
     }
 
     outDisplayTexture.write(float4(encodedOut, 1.0f), gid);
+}
+
+// ============================================================================
+// Stage 5: Ultra-Fast Bilinear Aspect-Fit Presentation & Video Recorder Blit
+// Decouples heavy 81-band Stage 4 math from the 3x Retina drawable resolution!
+// ============================================================================
+kernel void kernel_present_or_record_bgra8(
+    texture2d<float, access::sample> inSourceTexture [[texture(0)]],
+    texture2d<float, access::write> outTargetTexture [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint dstW = outTargetTexture.get_width();
+    uint dstH = outTargetTexture.get_height();
+    if (gid.x >= dstW || gid.y >= dstH) return;
+
+    uint srcW = inSourceTexture.get_width();
+    uint srcH = inSourceTexture.get_height();
+
+    float dstAspect = float(dstW) / float(max(dstH, 1u));
+    float srcAspect = float(srcW) / float(max(srcH, 1u));
+    float2 normUV = (float2(gid) + 0.5f) / float2(float(max(dstW, 1u)), float(max(dstH, 1u)));
+
+    if (dstAspect > srcAspect) {
+        float scaleY = srcAspect / dstAspect;
+        normUV.y = (normUV.y - 0.5f) * scaleY + 0.5f;
+    } else {
+        float scaleX = dstAspect / srcAspect;
+        normUV.x = (normUV.x - 0.5f) * scaleX + 0.5f;
+    }
+
+    constexpr sampler bilinearSampler(coord::normalized, address::clamp_to_edge, filter::linear);
+    float4 c = inSourceTexture.sample(bilinearSampler, clamp(normUV, float2(0.0f), float2(1.0f)));
+    outTargetTexture.write(float4(c.rgb, 1.0f), gid);
 }

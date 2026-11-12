@@ -3,16 +3,22 @@
 //  SpektraCam
 //
 //  Native Darkroom UI & ProMotion MetalKit Viewfinder for iPhone 13 Pro Max (6.7" 428x926 pt)
-//  - Zero-Lag Shutter & 12MP (3024x4032) Full-Resolution Output
-//  - Optional "+DNG" toggle on the Exposure tab if the user also wants the raw 75MB DNG negative saved alongside the 12MP film print
+//  - Flicker-Free Drawable Acquisition: `view.currentDrawable` is NEVER touched unless a new frame/parameter
+//    revision is ready AND a GPU slot is acquired, completely eliminating triple-buffer swapchain strobing!
+//  - Equatable Subview Isolation (`FilmStockCarouselStrip`): Dragging sliders no longer diffs all 27 film/paper buttons!
 //
 
 import SwiftUI
 import MetalKit
 import CoreVideo
+import CoreMedia
 
 public struct MetalFilmViewfinder: UIViewRepresentable {
-    @ObservedObject var cameraService: CameraCaptureService
+    public let cameraService: CameraCaptureService
+
+    public init(cameraService: CameraCaptureService) {
+        self.cameraService = cameraService
+    }
 
     public func makeCoordinator() -> Coordinator {
         Coordinator(cameraService: cameraService)
@@ -24,6 +30,8 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
         mtkView.framebufferOnly = false
         mtkView.colorPixelFormat = .bgra8Unorm
         mtkView.preferredFramesPerSecond = 60
+        mtkView.contentScaleFactor = 2.0
+        mtkView.presentsWithTransaction = false
         mtkView.enableSetNeedsDisplay = false
         mtkView.isPaused = false
         mtkView.autoResizeDrawable = true
@@ -36,39 +44,122 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
 
     public final class Coordinator: NSObject, MTKViewDelegate {
         let cameraService: CameraCaptureService
+        private var lastRenderedRevision: UInt64 = 0
 
         init(cameraService: CameraCaptureService) {
             self.cameraService = cameraService
             super.init()
         }
 
-        public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+        public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+            lastRenderedRevision = 0
+        }
 
         public func draw(in view: MTKView) {
-            guard let drawable = view.currentDrawable else { return }
-            guard let pb = cameraService.latestPixelBuffer,
+            // 1. Check for a new camera frame or parameter change BEFORE touching `view.currentDrawable`!
+            //    When `AVCapturePhotoOutput` briefly pauses preview frames during a 12MP shutter capture,
+            //    returning early here keeps the last presented frame rock-steady on screen with zero flicker!
+            let snapshot = cameraService.latestFrameSnapshot()
+            guard let pb = snapshot.pixelBuffer,
+                  snapshot.combinedRevision != lastRenderedRevision,
                   let renderer = cameraService.metalRenderer else {
-                if let cmdBuf = cameraService.metalRenderer?.commandQueue.makeCommandBuffer(),
-                   let rpd = view.currentRenderPassDescriptor,
-                   let enc = cmdBuf.makeRenderCommandEncoder(descriptor: rpd) {
-                    enc.endEncoding()
-                    cmdBuf.present(drawable)
-                    cmdBuf.commit()
-                }
+                return
+            }
+
+            // 2. Acquire a GPU slot BEFORE touching `view.currentDrawable` so `CAMetalLayer` never dequeues
+            //    an unrendered swapchain buffer.
+            guard renderer.tryAcquireViewfinderSlot() else {
+                return
+            }
+
+            guard let drawable = view.currentDrawable else {
+                renderer.releaseViewfinderSlot()
                 return
             }
 
             let liveParams = cameraService.activeParameters
             let liveLogCurve = cameraService.logTransferCurve
+            let recTarget = cameraService.isRecordingVideo ? cameraService.dequeueVideoRecordingBufferIfNeeded() : nil
 
-            if renderer.processVideoSampleBuffer(
+            let didRender = renderer.renderViewfinderDrawable(
                 pixelBuffer: pb,
                 params: liveParams,
                 logCurve: liveLogCurve,
-                outputDrawableTexture: drawable.texture
-            ) != nil {
-                drawable.present()
+                drawable: drawable,
+                recordingPixelBuffer: recTarget?.pixelBuffer,
+                recordBakedFilm: recTarget?.bakeFilm ?? true
+            )
+
+            if didRender {
+                lastRenderedRevision = snapshot.combinedRevision
+                if let validRec = recTarget {
+                    cameraService.appendRecordedVideoFrame(validRec.pixelBuffer, pts: snapshot.pts)
+                }
             }
+        }
+    }
+}
+
+private struct FilmStockCarouselStrip: View, Equatable {
+    @Binding var selectedNegID: String
+    @Binding var selectedPrintID: String
+
+    static func == (lhs: FilmStockCarouselStrip, rhs: FilmStockCarouselStrip) -> Bool {
+        lhs.selectedNegID == rhs.selectedNegID && lhs.selectedPrintID == rhs.selectedPrintID
+    }
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: 8) {
+                    ForEach(FilmStockDatabase.cameraStocks) { stock in
+                        let isSelected = (selectedNegID == stock.id)
+                        Button {
+                            selectedNegID = stock.id
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(stock.name)
+                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                    .foregroundColor(isSelected ? .black : .white)
+                                Text("\(Int(stock.isoSpeed)) ISO · \(Int(stock.referenceKelvin))K")
+                                    .font(.system(size: 9, weight: .regular, design: .monospaced))
+                                    .foregroundColor(isSelected ? .black.opacity(0.8) : .gray)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(isSelected ? Color.orange : Color(white: 0.14))
+                            .cornerRadius(8)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .frame(height: 38)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: 8) {
+                    ForEach(FilmStockDatabase.printStocks) { paper in
+                        let isSelected = (selectedPrintID == paper.id)
+                        Button {
+                            selectedPrintID = paper.id
+                        } label: {
+                            Text("Print: \(paper.name)")
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .foregroundColor(isSelected ? .orange : .gray)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color(white: 0.1))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .stroke(isSelected ? Color.orange : Color.clear, lineWidth: 1)
+                                )
+                                .cornerRadius(6)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .frame(height: 26)
         }
     }
 }
@@ -102,7 +193,7 @@ public struct SpektraCamMainView: View {
 
                 ZStack(alignment: .bottomLeading) {
                     MetalFilmViewfinder(cameraService: cameraService)
-                        .aspectRatio(cameraService.isCaptureModeVideo ? (16.0 / 9.0) : (3.0 / 4.0), contentMode: .fit)
+                        .aspectRatio(cameraService.isCaptureModeVideo ? (9.0 / 16.0) : (3.0 / 4.0), contentMode: .fit)
                         .frame(maxWidth: .infinity)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                         .overlay(
@@ -119,6 +210,7 @@ public struct SpektraCamMainView: View {
                             var fresh = FilmSimulationParameters()
                             fresh.negativeStockID = currentNeg
                             fresh.printStockID = currentPrt
+                            fresh.lensFocalLengthMM = cameraService.activeLens.nominalFocalMM
                             params = fresh
                             cameraService.activeParameters = fresh
                         } label: {
@@ -130,15 +222,19 @@ public struct SpektraCamMainView: View {
                                 .background(Color.black.opacity(0.65))
                                 .cornerRadius(12)
                         }
+                        .buttonStyle(.plain)
                     }
                     .padding(10)
                 }
 
-                filmAndPrintCarousel
+                FilmStockCarouselStrip(
+                    selectedNegID: $params.negativeStockID,
+                    selectedPrintID: $params.printStockID
+                )
+                .equatable()
 
                 if showDarkroomDrawer {
                     darkroomParameterDrawer
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
                 Spacer(minLength: 0)
@@ -170,7 +266,7 @@ public struct SpektraCamMainView: View {
                     .lineLimit(1)
                 Text(cameraService.statusBannerText)
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundColor(cameraService.isProcessing12MPPhoto ? .yellow : .gray)
+                    .foregroundColor(cameraService.isProcessing12MPPhoto ? .yellow : (cameraService.isRecordingVideo ? .red : .gray))
                     .lineLimit(1)
             }
             Spacer()
@@ -197,55 +293,7 @@ public struct SpektraCamMainView: View {
                         .background(cameraService.activeLens == lens ? Color.orange : Color.black.opacity(0.65))
                         .cornerRadius(14)
                 }
-            }
-        }
-    }
-
-    private var filmAndPrintCarousel: some View {
-        VStack(spacing: 4) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(FilmStockDatabase.cameraStocks) { stock in
-                        Button {
-                            params.negativeStockID = stock.id
-                        } label: {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(stock.name)
-                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                    .foregroundColor(params.negativeStockID == stock.id ? .black : .white)
-                                Text("\(Int(stock.isoSpeed)) ISO · \(Int(stock.referenceKelvin))K")
-                                    .font(.system(size: 9, weight: .regular, design: .monospaced))
-                                    .foregroundColor(params.negativeStockID == stock.id ? .black.opacity(0.8) : .gray)
-                            }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
-                            .background(params.negativeStockID == stock.id ? Color.orange : Color(white: 0.14))
-                            .cornerRadius(8)
-                        }
-                    }
-                }
-            }
-
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(FilmStockDatabase.printStocks) { paper in
-                        Button {
-                            params.printStockID = paper.id
-                        } label: {
-                            Text("Print: \(paper.name)")
-                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                                .foregroundColor(params.printStockID == paper.id ? .orange : .gray)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(Color(white: 0.1))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 6)
-                                        .stroke(params.printStockID == paper.id ? Color.orange : Color.clear, lineWidth: 1)
-                                )
-                                .cornerRadius(6)
-                        }
-                    }
-                }
+                .buttonStyle(.plain)
             }
         }
     }
@@ -266,6 +314,7 @@ public struct SpektraCamMainView: View {
                                 .background(selectedTab == tab ? Color.yellow : Color(white: 0.16))
                                 .cornerRadius(6)
                         }
+                        .buttonStyle(.plain)
                     }
                 }
             }
@@ -407,6 +456,7 @@ public struct SpektraCamMainView: View {
                         .background(cameraService.isCaptureModeVideo ? Color.red : Color.orange)
                         .cornerRadius(8)
                 }
+                .buttonStyle(.plain)
 
                 Button {
                     if cameraService.isCaptureModeVideo {
@@ -424,14 +474,13 @@ public struct SpektraCamMainView: View {
                             .frame(width: cameraService.isRecordingVideo ? 30 : 52,
                                    height: cameraService.isRecordingVideo ? 30 : 52)
                             .opacity(cameraService.isProcessing12MPPhoto ? 0.65 : 1.0)
-                            .animation(.easeInOut(duration: 0.2), value: cameraService.isRecordingVideo)
+                            .animation(.easeInOut(duration: 0.15), value: cameraService.isRecordingVideo)
                     }
                 }
+                .buttonStyle(.plain)
 
                 Button {
-                    withAnimation {
-                        showDarkroomDrawer.toggle()
-                    }
+                    showDarkroomDrawer.toggle()
                 } label: {
                     Text(showDarkroomDrawer ? "HIDE LAB" : "DARKROOM")
                         .font(.system(size: 11, weight: .bold, design: .monospaced))
@@ -441,6 +490,7 @@ public struct SpektraCamMainView: View {
                         .background(Color(white: 0.2))
                         .cornerRadius(8)
                 }
+                .buttonStyle(.plain)
             }
         }
     }

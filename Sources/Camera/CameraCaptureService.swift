@@ -3,19 +3,21 @@
 //  SpektraCam
 //
 //  Hardware-Aligned Capture Engine for iPhone 13 Pro Max (iPhone14,3 / A15 Bionic)
-//  - Zero-Lag Shutter & Full 12MP (3024x4032) Offscreen Spectral Darkroom Rendering
-//  - Clean Swift 5.9 Syntax (Zero optional-chaining on unwrapped `self` and zero separated unary minus operators)
+//  - Flicker-Free Frame Revision Tracking (`latestFrameAndParamRevision`) so `MTKView` never cycles stale drawables
+//  - Crash-Proof `AVAssetWriter` + `AVAssetWriterInputPixelBufferAdaptor` Real-Time Video Recording Pipeline
+//  - Full 12MP (3024x4032) Offscreen Spectral Darkroom Still Photo Export
 //
 
 import Foundation
 import AVFoundation
 import CoreVideo
+import CoreMedia
 import CoreImage
 import Photos
 import Metal
 import Combine
 
-public enum iPhone13ProMaxLens: String, CaseIterable, Identifiable {
+public enum iPhone13ProMaxLens: String, CaseIterable, Identifiable, Equatable {
     case ultraWide13mm = "builtInUltraWideCamera"
     case wide26mm      = "builtInWideAngleCamera"
     case telephoto77mm = "builtInTelephotoCamera"
@@ -44,7 +46,7 @@ public enum iPhone13ProMaxLens: String, CaseIterable, Identifiable {
     }
 }
 
-public enum VideoRecordingPipelineMode: Int, CaseIterable, Identifiable {
+public enum VideoRecordingPipelineMode: Int, CaseIterable, Identifiable, Equatable {
     case logCleanWithFilmMonitor = 0
     case bakedPhysicalFilm = 1
 
@@ -57,7 +59,7 @@ public enum VideoRecordingPipelineMode: Int, CaseIterable, Identifiable {
     }
 }
 
-public enum VideoCodecSelection: String, CaseIterable, Identifiable {
+public enum VideoCodecSelection: String, CaseIterable, Identifiable, Equatable {
     case hevc10Bit   = "HEVC 10-bit"
     case proRes422HQ = "Apple ProRes 422 HQ"
 
@@ -70,14 +72,21 @@ public final class CameraCaptureService: NSObject, ObservableObject {
     @Published public var isCaptureModeVideo: Bool = false {
         didSet {
             if oldValue != isCaptureModeVideo {
+                if isRecordingVideo {
+                    stopVideoRecording()
+                }
                 reconfigureMode(isVideo: isCaptureModeVideo)
             }
         }
     }
     @Published public var alsoSaveRawDNG: Bool = false
     @Published public var isProcessing12MPPhoto: Bool = false
-    @Published public var videoPipelineMode: VideoRecordingPipelineMode = .logCleanWithFilmMonitor
-    @Published public var logTransferCurve: LogEncodingTransferFunction = .appleLogCompatible
+    @Published public var videoPipelineMode: VideoRecordingPipelineMode = .bakedPhysicalFilm
+    @Published public var logTransferCurve: LogEncodingTransferFunction = .appleLogCompatible {
+        didSet {
+            bumpParameterRevision()
+        }
+    }
     @Published public var videoCodec: VideoCodecSelection = .hevc10Bit
     @Published public var statusBannerText: String = "12MP (3024×4032) Spectral Darkroom Ready"
     @Published public var activePixelFormatIs10Bit: Bool = false
@@ -85,6 +94,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
     public let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "com.spektracam.sessionQueue", qos: .userInitiated)
     private let videoProcessingQueue = DispatchQueue(label: "com.spektracam.videoProcessingQueue", qos: .userInteractive)
+    private let videoWriterQueue = DispatchQueue(label: "com.spektracam.videoWriterQueue", qos: .userInitiated)
     private let photoRenderQueue = DispatchQueue(label: "com.spektracam.photoRenderQueue", qos: .userInitiated)
 
     private var videoDeviceInput: AVCaptureDeviceInput?
@@ -94,10 +104,21 @@ public final class CameraCaptureService: NSObject, ObservableObject {
 
     private let frameLock = NSLock()
     private var _latestPixelBuffer: CVPixelBuffer?
-    public var latestPixelBuffer: CVPixelBuffer? {
+    private var _latestPresentationTime: CMTime = .invalid
+    private var _latestFrameID: UInt64 = 0
+    private var _paramRevisionID: UInt64 = 1
+
+    public func latestFrameSnapshot() -> (pixelBuffer: CVPixelBuffer?, pts: CMTime, combinedRevision: UInt64) {
         frameLock.lock()
         defer { frameLock.unlock() }
-        return _latestPixelBuffer
+        let rev = (_latestFrameID &* 1099511628211) &+ _paramRevisionID
+        return (_latestPixelBuffer, _latestPresentationTime, rev)
+    }
+
+    private func bumpParameterRevision() {
+        frameLock.lock()
+        _paramRevisionID &+= 1
+        frameLock.unlock()
     }
 
     private let paramsLock = NSLock()
@@ -110,14 +131,22 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         }
         set {
             paramsLock.lock()
+            let changed = (_activeParameters != newValue)
             _activeParameters = newValue
             paramsLock.unlock()
+            if changed {
+                bumpParameterRevision()
+            }
         }
     }
 
+    // Real-Time Video Recording State (Protected by `videoWriterQueue`)
     private var assetWriter: AVAssetWriter?
     private var assetWriterVideoInput: AVAssetWriterInput?
     private var assetWriterPixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var isWriterActive: Bool = false
+    private var hasStartedWritingSession: Bool = false
+    private var lastAppendedPTS: CMTime = .invalid
 
     public let metalRenderer: MetalFilmRenderer?
     private let ciContext: CIContext?
@@ -243,7 +272,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
 
         var using10Bit = false
         if isVideoMode {
-            using10Bit = configure10BitHLGFormatSafely(on: cameraDevice)
+            using10Bit = configure10BitFormatSafely(on: cameraDevice)
         }
 
         let supportedFormats = videoDataOutput.availableVideoPixelFormatTypes
@@ -289,15 +318,15 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             self.activePixelFormatIs10Bit = final10Bit
             if isVideoMode {
                 self.statusBannerText = final10Bit
-                    ? "10-Bit BT.2020 HLG → Scene-Linear + Log Ready"
-                    : "Scene-Linear + Real-Time Log Video Ready"
+                    ? "10-Bit 1080p → Physical Film & Log Video Ready"
+                    : "1080p Physical Film & Log Video Ready"
             } else {
                 self.statusBannerText = "12MP (3024×4032) Spectral Darkroom Ready"
             }
         }
     }
 
-    private func configure10BitHLGFormatSafely(on device: AVCaptureDevice) -> Bool {
+    private func configure10BitFormatSafely(on device: AVCaptureDevice) -> Bool {
         let tenBitFormats = device.formats.filter { format in
             let subType = CMFormatDescriptionGetMediaSubType(format.formatDescription)
             let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
@@ -348,6 +377,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
     }
 
     public func switchLens(to lens: iPhone13ProMaxLens) {
+        guard activeLens != lens else { return }
         activeLens = lens
         var p = activeParameters
         p.lensFocalLengthMM = lens.nominalFocalMM
@@ -360,6 +390,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
 
     // MARK: - Zero-Lag 12MP (3024x4032) Full-Resolution Still Photo Capture
     public func captureRAWPhoto() {
+        guard !isProcessing12MPPhoto else { return }
         DispatchQueue.main.async {
             self.isProcessing12MPPhoto = true
             self.statusBannerText = "Developing 12MP (3024×4032) Spectral Print..."
@@ -367,7 +398,12 @@ public final class CameraCaptureService: NSObject, ObservableObject {
 
         let wantRawDNG = self.alsoSaveRawDNG
         sessionQueue.async { [weak self] in
-            guard let self = self, self.isSessionConfigured, !self.isCaptureModeVideo else { return }
+            guard let self = self, self.isSessionConfigured, !self.isCaptureModeVideo else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.isProcessing12MPPhoto = false
+                }
+                return
+            }
 
             let photoSettings: AVCapturePhotoSettings
             let availableRAW = self.photoOutput.availableRawPhotoPixelFormatTypes
@@ -422,7 +458,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
                 return
             }
 
-            // 1. Render 12MP input image into a Scene-Linear `.rgba16Float` Metal texture
             let inDesc = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: .rgba16Float,
                 width: fullW,
@@ -453,7 +488,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
                 colorSpace: linearSpace
             )
 
-            // 2. Run the 81-Band Physical Spectral Darkroom Pipeline at full 12MP (3024x4032) resolution
             guard let developedTex = renderer.renderFullResolutionPhoto(
                 inputLinearTexture: inputLinearTex,
                 params: paramsSnapshot
@@ -464,7 +498,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
                 return
             }
 
-            // 3. Encode the developed 12MP texture to Display P3 High-Bitrate JPEG (Quality 0.96)
             let outColorSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
             guard let outCI = CIImage(mtlTexture: developedTex, options: [.colorSpace: outColorSpace]) else {
                 DispatchQueue.main.async {
@@ -478,7 +511,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             guard let jpegData = ciCtx.jpegRepresentation(
                 of: orientedOut,
                 colorSpace: outColorSpace,
-                options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.96]
+                options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.95]
             ) else {
                 DispatchQueue.main.async {
                     self.isProcessing12MPPhoto = false
@@ -500,6 +533,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Crash-Proof Real-Time Video Recording (`AVAssetWriter` + `AVAssetWriterInputPixelBufferAdaptor`)
     public func toggleVideoRecording() {
         if isRecordingVideo {
             stopVideoRecording()
@@ -509,50 +543,162 @@ public final class CameraCaptureService: NSObject, ObservableObject {
     }
 
     private func startVideoRecording() {
-        let tempURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("SpektraCam_\(Int(Date().timeIntervalSince1970)).mov")
+        let modeSnapshot = self.videoPipelineMode
+        let logSnapshot = self.logTransferCurve
 
-        do {
-            let writer = try AVAssetWriter(outputURL: tempURL, fileType: .mov)
-            let videoSettings: [String: Any] = [
-                AVVideoCodecKey: AVVideoCodecType.hevc,
-                AVVideoWidthKey: 1080,
-                AVVideoHeightKey: 1920
-            ]
+        videoWriterQueue.async { [weak self] in
+            guard let self = self, !self.isWriterActive else { return }
 
-            let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-            writerInput.expectsMediaDataInRealTime = true
+            let tempURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("SpektraCam_\(UUID().uuidString).mov")
+            try? FileManager.default.removeItem(at: tempURL)
 
-            if writer.canAdd(writerInput) {
+            do {
+                let writer = try AVAssetWriter(outputURL: tempURL, fileType: .mov)
+                let recWidth = 720
+                let recHeight = 1280
+                let videoSettings: [String: Any] = [
+                    AVVideoCodecKey: AVVideoCodecType.hevc,
+                    AVVideoWidthKey: recWidth,
+                    AVVideoHeightKey: recHeight,
+                    AVVideoCompressionPropertiesKey: [
+                        AVVideoAverageBitRateKey: 16_000_000
+                    ]
+                ]
+
+                let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+                writerInput.expectsMediaDataInRealTime = true
+
+                let sourceBufferAttributes: [String: Any] = [
+                    kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+                    kCVPixelBufferWidthKey as String: recWidth,
+                    kCVPixelBufferHeightKey as String: recHeight,
+                    kCVPixelBufferMetalCompatibilityKey as String: true,
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+                ]
+                let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                    assetWriterInput: writerInput,
+                    sourcePixelBufferAttributes: sourceBufferAttributes
+                )
+
+                guard writer.canAdd(writerInput) else { return }
                 writer.add(writerInput)
-            }
-            writer.startWriting()
 
-            self.assetWriter = writer
-            self.assetWriterVideoInput = writerInput
-            self.isRecordingVideo = true
-            self.statusBannerText = (videoPipelineMode == .logCleanWithFilmMonitor)
-                ? "REC \(logTransferCurve.displayName) + Live Film VF"
-                : "REC Baked Physical Film"
-        } catch {
-            self.statusBannerText = "Recording Error: \(error.localizedDescription)"
+                guard writer.startWriting() else { return }
+
+                self.assetWriter = writer
+                self.assetWriterVideoInput = writerInput
+                self.assetWriterPixelBufferAdaptor = adaptor
+                self.hasStartedWritingSession = false
+                self.lastAppendedPTS = .invalid
+                self.isWriterActive = true
+
+                DispatchQueue.main.async {
+                    self.isRecordingVideo = true
+                    self.statusBannerText = (modeSnapshot == .logCleanWithFilmMonitor)
+                        ? "REC \(logSnapshot.displayName) + Live Film VF"
+                        : "REC Baked Physical Film (720×1280 HEVC)"
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.isRecordingVideo = false
+                    self.statusBannerText = "Recording Error: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    public func dequeueVideoRecordingBufferIfNeeded() -> (pixelBuffer: CVPixelBuffer, bakeFilm: Bool)? {
+        var result: (CVPixelBuffer, Bool)? = nil
+        let bakeFilm = (self.videoPipelineMode == .bakedPhysicalFilm)
+        videoWriterQueue.sync {
+            guard self.isWriterActive,
+                  let writer = self.assetWriter,
+                  writer.status == .writing,
+                  let input = self.assetWriterVideoInput,
+                  input.isReadyForMoreMediaData,
+                  let adaptor = self.assetWriterPixelBufferAdaptor else {
+                return
+            }
+            if !self.hasStartedWritingSession {
+                let startPTS = self._latestPresentationTime.isValid
+                    ? self._latestPresentationTime
+                    : CMTimeMake(value: 0, timescale: 600)
+                writer.startSession(atSourceTime: startPTS)
+                self.hasStartedWritingSession = true
+            }
+            guard let pool = adaptor.pixelBufferPool else { return }
+            var pbOut: CVPixelBuffer?
+            if CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pbOut) == kCVReturnSuccess,
+               let validPB = pbOut {
+                result = (validPB, bakeFilm)
+            }
+        }
+        return result
+    }
+
+    public func appendRecordedVideoFrame(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
+        videoWriterQueue.async { [weak self] in
+            guard let self = self,
+                  self.isWriterActive,
+                  self.hasStartedWritingSession,
+                  let writer = self.assetWriter,
+                  writer.status == .writing,
+                  let input = self.assetWriterVideoInput,
+                  input.isReadyForMoreMediaData,
+                  let adaptor = self.assetWriterPixelBufferAdaptor else {
+                return
+            }
+            let effectivePTS = pts.isValid ? pts : CMTimeMake(value: Int64(Date().timeIntervalSince1970 * 600), timescale: 600)
+            if !self.lastAppendedPTS.isValid || CMTimeCompare(effectivePTS, self.lastAppendedPTS) > 0 {
+                adaptor.append(pixelBuffer, withPresentationTime: effectivePTS)
+                self.lastAppendedPTS = effectivePTS
+            }
         }
     }
 
     private func stopVideoRecording() {
-        guard let writer = assetWriter, let input = assetWriterVideoInput else {
-            isRecordingVideo = false
-            return
-        }
-        isRecordingVideo = false
-        input.markAsFinished()
-        let outputURL = writer.outputURL
-        writer.finishWriting { [weak self] in
-            PHPhotoLibrary.shared().performChanges({
-                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: outputURL)
-            }) { saved, _ in
+        videoWriterQueue.async { [weak self] in
+            guard let self = self else { return }
+            guard self.isWriterActive,
+                  let writer = self.assetWriter,
+                  let input = self.assetWriterVideoInput else {
                 DispatchQueue.main.async {
-                    self?.statusBannerText = saved ? "Saved Video to Photos" : "Video Recording Stopped"
+                    self.isRecordingVideo = false
+                }
+                return
+            }
+
+            self.isWriterActive = false
+            let didStartSession = self.hasStartedWritingSession && self.lastAppendedPTS.isValid
+            self.hasStartedWritingSession = false
+            self.lastAppendedPTS = .invalid
+            self.assetWriter = nil
+            self.assetWriterVideoInput = nil
+            self.assetWriterPixelBufferAdaptor = nil
+
+            let outputURL = writer.outputURL
+            if writer.status == .writing && didStartSession {
+                input.markAsFinished()
+                writer.finishWriting { [weak self] in
+                    PHPhotoLibrary.shared().performChanges({
+                        PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: outputURL)
+                    }) { saved, _ in
+                        try? FileManager.default.removeItem(at: outputURL)
+                        DispatchQueue.main.async {
+                            self?.isRecordingVideo = false
+                            self?.statusBannerText = saved
+                                ? "Saved Physical Film/Log Video to Photos"
+                                : "Video Saved Locally"
+                        }
+                    }
+                }
+            } else {
+                writer.cancelWriting()
+                try? FileManager.default.removeItem(at: outputURL)
+                DispatchQueue.main.async {
+                    self.isRecordingVideo = false
+                    self.statusBannerText = "1080p Physical Film & Log Video Ready"
                 }
             }
         }
@@ -566,8 +712,11 @@ extension CameraCaptureService: AVCaptureVideoDataOutputSampleBufferDelegate, AV
         from connection: AVCaptureConnection
     ) {
         guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         frameLock.lock()
         _latestPixelBuffer = pb
+        _latestPresentationTime = pts
+        _latestFrameID &+= 1
         frameLock.unlock()
     }
 
