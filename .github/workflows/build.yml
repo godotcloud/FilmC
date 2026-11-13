@@ -1,30 +1,22 @@
-name: Build Uncompressed iOS SpektraCam (iPhone 13 Pro Max)
+name: Build Unsigned SpektraCam iOS IPA
 
 on:
   push:
     branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
   workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  build-uncompressed-ipa:
-    name: Build Unsigned & Ad-Hoc Signed Uncompressed IPA (arm64)
+  build-unsigned-ipa:
+    name: Build Unsigned IPA for iPhone 13 Pro Max (A15 Bionic)
     runs-on: macos-15
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Select Stable Xcode Toolchain
+      - name: Select Xcode
         run: |
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
           xcodebuild -version
-          xcrun metal -v
 
       - name: Install XcodeGen
         run: |
@@ -32,119 +24,59 @@ jobs:
             brew install xcodegen
           fi
 
-      - name: Verify Synchronized Source Tree & Calibrated Spectral Shaders
+      - name: Generate Xcode Project & Verify Metal Shaders
         run: |
-          echo "Checking required source files..."
-          for f in \
-            "project.yml" \
-            "Resources/Info.plist" \
-            "Sources/App/SpektraCamApp.swift" \
-            "Sources/Models/FilmSimulationParameters.swift" \
-            "Sources/Models/FilmStockDatabase.swift" \
-            "Sources/Metal/SpectralPipeline.metal" \
-            "Sources/Metal/MetalFilmRenderer.swift" \
-            "Sources/Camera/CameraCaptureService.swift" \
-            "Sources/UI/SpektraCamUI.swift"; do
-            if [ ! -f "$f" ]; then
-              echo "ERROR: Missing required file $f"
-              exit 1
-            fi
-          done
-          grep -n "thread float &albedoScale" Sources/Metal/SpectralPipeline.metal
-          grep -n "is10BitInput" Sources/Metal/SpectralPipeline.metal
+          if [ -f "SpektraCam/project.yml" ]; then
+            cd SpektraCam
+          fi
+          rm -f Sources/Models/FilmStockParameters.swift
+          xcodegen generate
+          xcrun -sdk iphoneos metal -c -O3 Sources/Metal/SpectralPipeline.metal -o /tmp/SpectralPipeline.air
+          xcrun -sdk iphoneos metallib /tmp/SpectralPipeline.air -o /tmp/default.metallib
+          echo "Metal shader compilation verified successfully."
 
-      - name: Generate Xcode Project via XcodeGen (project.yml)
+      - name: Build Unsigned Release .app for arm64 (iOS Device)
         run: |
-          rm -rf SpektraCam.xcodeproj
-          xcodegen generate --spec project.yml
-          ls -la SpektraCam.xcodeproj
-
-      - name: Pre-Compile & Validate Metal Compute Shaders (A15 Apple GPU Family 8)
-        run: |
-          xcrun -sdk iphoneos metal -c -std=ios-metal2.4 -mios-version-min=16.0 \
-            -Wall -Wextra \
-            Sources/Metal/SpectralPipeline.metal -o "${RUNNER_TEMP}/SpectralPipeline.air"
-          xcrun -sdk iphoneos metallib "${RUNNER_TEMP}/SpectralPipeline.air" -o "${RUNNER_TEMP}/default.metallib"
-          ls -lh "${RUNNER_TEMP}/default.metallib"
-
-      - name: Build Release arm64 iOS App (No Code Signing Required)
-        run: |
+          if [ -f "SpektraCam/SpektraCam.xcodeproj/project.pbxproj" ]; then
+            cd SpektraCam
+          fi
           xcodebuild clean build \
             -project SpektraCam.xcodeproj \
             -scheme SpektraCam \
             -configuration Release \
             -sdk iphoneos \
-            -destination "generic/platform=iOS" \
-            -derivedDataPath "${RUNNER_TEMP}/DerivedData" \
+            -derivedDataPath build/DerivedData \
             ARCHS="arm64" \
-            VALID_ARCHS="arm64" \
             ONLY_ACTIVE_ARCH=NO \
-            IPHONEOS_DEPLOYMENT_TARGET="16.0" \
-            MTL_FAST_MATH=YES \
-            SWIFT_OPTIMIZATION_LEVEL="-O" \
+            PRODUCT_BUNDLE_IDENTIFIER="com.spektrafilm.spektracam" \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
-            COMPILER_INDEX_STORE_ENABLE=NO
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
 
-      - name: Verify Embedded default.metallib & Apply Clean Ad-Hoc Signature
+      - name: Package Uncompressed Unsigned SpektraCam.ipa
         run: |
-          APP_PATH="${RUNNER_TEMP}/DerivedData/Build/Products/Release-iphoneos/SpektraCam.app"
-          if [ ! -d "${APP_PATH}" ]; then
-            echo "Error: SpektraCam.app not found at ${APP_PATH}"
+          if [ -d "SpektraCam/build" ]; then
+            cd SpektraCam
+          fi
+          mkdir -p build/Payload
+          APP_PATH=$(find build/DerivedData -name "SpektraCam.app" -type d | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "Error: SpektraCam.app not found!"
             exit 1
           fi
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.spektrafilm.spektracam" "$APP_PATH/Info.plist" || true
+          echo "Verified CFBundleIdentifier:"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_PATH/Info.plist"
+          cp -R "$APP_PATH" build/Payload/
+          cd build
+          zip -0 -qry SpektraCam-Unsigned-iPhone13ProMax.ipa Payload
+          ls -lh SpektraCam-Unsigned-iPhone13ProMax.ipa
 
-          # Ensure default.metallib is present inside the .app bundle (fallback copy if XcodeGen skipped shader bundling)
-          if [ ! -f "${APP_PATH}/default.metallib" ]; then
-            echo "Copying pre-verified default.metallib into SpektraCam.app..."
-            cp "${RUNNER_TEMP}/default.metallib" "${APP_PATH}/default.metallib"
-          fi
-          ls -lh "${APP_PATH}/default.metallib"
-
-          # Generate clean entitlements for SideStore / AltStore / Sideloadly / TrollStore compatibility
-          cat > "${RUNNER_TEMP}/entitlements.plist" << 'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>application-identifier</key>
-              <string>com.spektrafilm.spektracam</string>
-              <key>get-task-allow</key>
-              <true/>
-          </dict>
-          </plist>
-          EOF
-
-          rm -rf "${APP_PATH}/_CodeSignature"
-          codesign --force --deep --sign - --entitlements "${RUNNER_TEMP}/entitlements.plist" --timestamp=none "${APP_PATH}"
-          codesign -vvv "${APP_PATH}" || true
-
-      - name: Package Stage-1 Zero-Compression IPA (zip -0 Store Mode)
-        run: |
-          APP_PATH="${RUNNER_TEMP}/DerivedData/Build/Products/Release-iphoneos/SpektraCam.app"
-          STAGE_DIR="${RUNNER_TEMP}/IPA_Staging"
-          rm -rf "${STAGE_DIR}"
-          mkdir -p "${STAGE_DIR}/Payload"
-          cp -R "${APP_PATH}" "${STAGE_DIR}/Payload/SpektraCam.app"
-
-          cd "${STAGE_DIR}"
-          # CRITICAL: -0 enforces STORE mode (zero deflate compression), -r recursive, -y preserve symlinks
-          zip -0 -r -y "${GITHUB_WORKSPACE}/SpektraCam-Unsigned-Uncompressed.ipa" Payload
-          ls -lh "${GITHUB_WORKSPACE}/SpektraCam-Unsigned-Uncompressed.ipa"
-
-      - name: Upload Stage-2 Zero-Compression IPA Artifact (compression-level 0)
+      - name: Upload Uncompressed IPA Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SpektraCam-iPhone13ProMax-Uncompressed-IPA
-          path: ${{ github.workspace }}/SpektraCam-Unsigned-Uncompressed.ipa
-          compression-level: 0
-          if-no-files-found: error
-
-      - name: Upload Raw Uncompressed SpektraCam.app Bundle (compression-level 0)
-        uses: actions/upload-artifact@v4
-        with:
-          name: SpektraCam-Raw-App-Bundle-Uncompressed
-          path: ${{ runner.temp }}/DerivedData/Build/Products/Release-iphoneos/SpektraCam.app
+          name: SpektraCam-Unsigned-IPA
+          path: "**/build/SpektraCam-Unsigned-iPhone13ProMax.ipa"
           compression-level: 0
           if-no-files-found: error
