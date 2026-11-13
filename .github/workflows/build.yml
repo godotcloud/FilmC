@@ -66,8 +66,12 @@ jobs:
             exit 1
           fi
           /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.spektrafilm.spektracam" "$APP_PATH/Info.plist" || true
-          echo "Verified CFBundleIdentifier:"
+          /usr/libexec/PlistBuddy -c "Delete :UILaunchScreen" "$APP_PATH/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UILaunchScreen dict" "$APP_PATH/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :UILaunchScreen:UIColorName string" "$APP_PATH/Info.plist"
+          echo "Verified compiled Info.plist:"
           /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_PATH/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :UILaunchScreen" "$APP_PATH/Info.plist"
           cp -R "$APP_PATH" build/Payload/
           cd build
           zip -0 -qry SpektraCam-Unsigned-iPhone13ProMax.ipa Payload
