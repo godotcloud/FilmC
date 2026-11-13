@@ -3,9 +3,10 @@
 //  SpektraCam
 //
 //  Native Darkroom UI & ProMotion MetalKit Viewfinder for iPhone 13 Pro Max (6.7" 428x926 pt)
-//  - Flicker-Free Drawable Acquisition: `view.currentDrawable` is NEVER touched unless a new frame/parameter
-//    revision is ready AND a GPU slot is acquired, completely eliminating triple-buffer swapchain strobing!
-//  - Equatable Subview Isolation (`FilmStockCarouselStrip`): Dragging sliders no longer diffs all 27 film/paper buttons!
+//  - Fixed Viewfinder Layout: Uses explicit `.layoutPriority(1)` and places `.frame(maxWidth: .infinity, maxHeight: .infinity)`
+//    properly so the 3:4 viewfinder fills the screen cleanly without squishing or letterboxing.
+//  - Single-Line Lens & Film Pill Buttons (`.lineLimit(1)` + `.minimumScaleFactor(0.75)`) so text never wraps onto 2 lines!
+//  - GPU-Completion-Synchronized Video Recording (`onRecordingFrameCompleted`) so `AVAssetWriter` never races with Metal!
 //
 
 import SwiftUI
@@ -56,9 +57,6 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
         }
 
         public func draw(in view: MTKView) {
-            // 1. Check for a new camera frame or parameter change BEFORE touching `view.currentDrawable`!
-            //    When `AVCapturePhotoOutput` briefly pauses preview frames during a 12MP shutter capture,
-            //    returning early here keeps the last presented frame rock-steady on screen with zero flicker!
             let snapshot = cameraService.latestFrameSnapshot()
             guard let pb = snapshot.pixelBuffer,
                   snapshot.combinedRevision != lastRenderedRevision,
@@ -66,8 +64,6 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
                 return
             }
 
-            // 2. Acquire a GPU slot BEFORE touching `view.currentDrawable` so `CAMetalLayer` never dequeues
-            //    an unrendered swapchain buffer.
             guard renderer.tryAcquireViewfinderSlot() else {
                 return
             }
@@ -79,7 +75,12 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
 
             let liveParams = cameraService.activeParameters
             let liveLogCurve = cameraService.logTransferCurve
-            let recTarget = cameraService.isRecordingVideo ? cameraService.dequeueVideoRecordingBufferIfNeeded() : nil
+            let recTarget = cameraService.isRecordingVideo
+                ? cameraService.dequeueVideoRecordingBufferIfNeeded(cameraFrameID: snapshot.frameID)
+                : nil
+
+            let framePTS = snapshot.pts
+            let serviceRef = self.cameraService
 
             let didRender = renderer.renderViewfinderDrawable(
                 pixelBuffer: pb,
@@ -87,14 +88,16 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
                 logCurve: liveLogCurve,
                 drawable: drawable,
                 recordingPixelBuffer: recTarget?.pixelBuffer,
-                recordBakedFilm: recTarget?.bakeFilm ?? true
+                recordBakedFilm: recTarget?.bakeFilm ?? true,
+                onRecordingFrameCompleted: recTarget.map { validRec in
+                    return {
+                        serviceRef.appendRecordedVideoFrame(validRec.pixelBuffer, pts: framePTS)
+                    }
+                }
             )
 
             if didRender {
                 lastRenderedRevision = snapshot.combinedRevision
-                if let validRec = recTarget {
-                    cameraService.appendRecordedVideoFrame(validRec.pixelBuffer, pts: snapshot.pts)
-                }
             }
         }
     }
@@ -111,22 +114,24 @@ private struct FilmStockCarouselStrip: View, Equatable {
     var body: some View {
         VStack(spacing: 4) {
             ScrollView(.horizontal, showsIndicators: false) {
-                LazyHStack(spacing: 8) {
+                HStack(spacing: 6) {
                     ForEach(FilmStockDatabase.cameraStocks) { stock in
                         let isSelected = (selectedNegID == stock.id)
                         Button {
                             selectedNegID = stock.id
                         } label: {
-                            VStack(alignment: .leading, spacing: 2) {
+                            VStack(alignment: .leading, spacing: 1) {
                                 Text(stock.name)
                                     .font(.system(size: 11, weight: .bold, design: .monospaced))
                                     .foregroundColor(isSelected ? .black : .white)
+                                    .lineLimit(1)
                                 Text("\(Int(stock.isoSpeed)) ISO · \(Int(stock.referenceKelvin))K")
                                     .font(.system(size: 9, weight: .regular, design: .monospaced))
                                     .foregroundColor(isSelected ? .black.opacity(0.8) : .gray)
+                                    .lineLimit(1)
                             }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
                             .background(isSelected ? Color.orange : Color(white: 0.14))
                             .cornerRadius(8)
                         }
@@ -134,10 +139,10 @@ private struct FilmStockCarouselStrip: View, Equatable {
                     }
                 }
             }
-            .frame(height: 38)
+            .fixedSize(horizontal: false, vertical: true)
 
             ScrollView(.horizontal, showsIndicators: false) {
-                LazyHStack(spacing: 8) {
+                HStack(spacing: 6) {
                     ForEach(FilmStockDatabase.printStocks) { paper in
                         let isSelected = (selectedPrintID == paper.id)
                         Button {
@@ -146,6 +151,7 @@ private struct FilmStockCarouselStrip: View, Equatable {
                             Text("Print: \(paper.name)")
                                 .font(.system(size: 10, weight: .semibold, design: .monospaced))
                                 .foregroundColor(isSelected ? .orange : .gray)
+                                .lineLimit(1)
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 4)
                                 .background(Color(white: 0.1))
@@ -159,7 +165,7 @@ private struct FilmStockCarouselStrip: View, Equatable {
                     }
                 }
             }
-            .frame(height: 26)
+            .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
@@ -191,19 +197,20 @@ public struct SpektraCamMainView: View {
             VStack(spacing: 6) {
                 topTelemetryHeader
 
-                ZStack(alignment: .bottomLeading) {
+                // Viewfinder Container with `.layoutPriority(1)` so it always claims maximum available screen height
+                ZStack(alignment: .bottom) {
                     MetalFilmViewfinder(cameraService: cameraService)
-                        .aspectRatio(cameraService.isCaptureModeVideo ? (9.0 / 16.0) : (3.0 / 4.0), contentMode: .fit)
-                        .frame(maxWidth: .infinity)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .aspectRatio(3.0 / 4.0, contentMode: .fit)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                         .overlay(
                             RoundedRectangle(cornerRadius: 12)
-                                .stroke(Color.orange.opacity(0.45), lineWidth: 1)
+                                .stroke(cameraService.isRecordingVideo ? Color.red : Color.orange.opacity(0.45), lineWidth: cameraService.isRecordingVideo ? 2 : 1)
                         )
 
-                    HStack {
+                    HStack(spacing: 6) {
                         lensSelectorPill
-                        Spacer()
+                        Spacer(minLength: 4)
                         Button {
                             let currentNeg = params.negativeStockID
                             let currentPrt = params.printStockID
@@ -217,15 +224,19 @@ public struct SpektraCamMainView: View {
                             Text("RESET")
                                 .font(.system(size: 10, weight: .bold, design: .monospaced))
                                 .foregroundColor(.white)
+                                .lineLimit(1)
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 5)
-                                .background(Color.black.opacity(0.65))
+                                .background(Color.black.opacity(0.68))
                                 .cornerRadius(12)
                         }
                         .buttonStyle(.plain)
                     }
-                    .padding(10)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 8)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(1)
 
                 FilmStockCarouselStrip(
                     selectedNegID: $params.negativeStockID,
@@ -237,15 +248,14 @@ public struct SpektraCamMainView: View {
                     darkroomParameterDrawer
                 }
 
-                Spacer(minLength: 0)
-
                 bottomShutterDeck
             }
             .padding(.horizontal, 10)
             .padding(.top, 2)
-            .padding(.bottom, 6)
+            .padding(.bottom, 4)
         }
         .preferredColorScheme(.dark)
+        .dynamicTypeSize(.medium)
         .onAppear {
             cameraService.activeParameters = params
             cameraService.requestPermissionsAndSetup()
@@ -264,14 +274,17 @@ public struct SpektraCamMainView: View {
                     .font(.system(size: 12, weight: .bold, design: .monospaced))
                     .foregroundColor(.orange)
                     .lineLimit(1)
+                    .minimumScaleFactor(0.8)
                 Text(cameraService.statusBannerText)
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .foregroundColor(cameraService.isProcessing12MPPhoto ? .yellow : (cameraService.isRecordingVideo ? .red : .gray))
                     .lineLimit(1)
+                    .minimumScaleFactor(0.8)
             }
             Spacer()
             Text(params.filmFormatGate.displayName.components(separatedBy: " ").first ?? "35mm")
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .lineLimit(1)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
                 .background(Color.white.opacity(0.12))
@@ -280,18 +293,20 @@ public struct SpektraCamMainView: View {
     }
 
     private var lensSelectorPill: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 5) {
             ForEach(iPhone13ProMaxLens.allCases) { lens in
                 Button {
                     cameraService.switchLens(to: lens)
                 } label: {
                     Text(lens.focalLengthLabel)
-                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
                         .foregroundColor(cameraService.activeLens == lens ? .black : .white)
-                        .padding(.horizontal, 9)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                        .padding(.horizontal, 7)
                         .padding(.vertical, 5)
-                        .background(cameraService.activeLens == lens ? Color.orange : Color.black.opacity(0.65))
-                        .cornerRadius(14)
+                        .background(cameraService.activeLens == lens ? Color.orange : Color.black.opacity(0.68))
+                        .cornerRadius(12)
                 }
                 .buttonStyle(.plain)
             }
@@ -299,7 +314,7 @@ public struct SpektraCamMainView: View {
     }
 
     private var darkroomParameterDrawer: some View {
-        VStack(spacing: 5) {
+        VStack(spacing: 4) {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
                     ForEach(DarkroomInspectorTab.allCases) { tab in
@@ -309,8 +324,9 @@ public struct SpektraCamMainView: View {
                             Text(tab.rawValue)
                                 .font(.system(size: 11, weight: .bold, design: .monospaced))
                                 .foregroundColor(selectedTab == tab ? .black : .white)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
+                                .lineLimit(1)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 4)
                                 .background(selectedTab == tab ? Color.yellow : Color(white: 0.16))
                                 .cornerRadius(6)
                         }
@@ -318,15 +334,14 @@ public struct SpektraCamMainView: View {
                     }
                 }
             }
+            .fixedSize(horizontal: false, vertical: true)
 
             ScrollView(.vertical, showsIndicators: false) {
-                VStack(spacing: 8) {
+                VStack(spacing: 7) {
                     switch selectedTab {
                     case .exposure:
                         paramSlider(title: "Negative Exposure EV", value: $params.exposureCompensationEV, range: -4.0...4.0, unit: "EV")
                         Toggle("Auto Print EV Compensation", isOn: $params.autoPrintExposureComp)
-                            .font(.system(size: 11, design: .monospaced))
-                        Toggle("Also Save Raw 12-Bit DNG Negative", isOn: $cameraService.alsoSaveRawDNG)
                             .font(.system(size: 11, design: .monospaced))
                         paramSlider(title: "Optical Vignetting (cos⁴θ)", value: $params.opticalVignettingStrength, range: 0.0...1.0, unit: "")
                         paramSlider(title: "Scene Color Temp", value: $params.sceneIlluminantKelvin, range: 2800...9000, unit: "K")
@@ -402,7 +417,7 @@ public struct SpektraCamMainView: View {
                 }
                 .padding(8)
             }
-            .frame(height: 150)
+            .frame(height: 132)
             .background(Color(white: 0.09))
             .cornerRadius(10)
         }
@@ -414,10 +429,12 @@ public struct SpektraCamMainView: View {
                 Text(title)
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundColor(.white)
+                    .lineLimit(1)
                 Spacer()
                 Text(String(format: "%.2f %@", value.wrappedValue, unit))
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
                     .foregroundColor(.orange)
+                    .lineLimit(1)
             }
             Slider(value: value, in: range)
                 .tint(.orange)
@@ -451,6 +468,7 @@ public struct SpektraCamMainView: View {
                     Text(cameraService.isCaptureModeVideo ? "LOG VIDEO" : "12MP FILM")
                         .font(.system(size: 11, weight: .bold, design: .monospaced))
                         .foregroundColor(.black)
+                        .lineLimit(1)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)
                         .background(cameraService.isCaptureModeVideo ? Color.red : Color.orange)
@@ -468,11 +486,11 @@ public struct SpektraCamMainView: View {
                     ZStack {
                         Circle()
                             .stroke(Color.white, lineWidth: 3)
-                            .frame(width: 64, height: 64)
+                            .frame(width: 60, height: 60)
                         Circle()
                             .fill(cameraService.isCaptureModeVideo ? Color.red : Color.orange)
-                            .frame(width: cameraService.isRecordingVideo ? 30 : 52,
-                                   height: cameraService.isRecordingVideo ? 30 : 52)
+                            .frame(width: cameraService.isRecordingVideo ? 28 : 48,
+                                   height: cameraService.isRecordingVideo ? 28 : 48)
                             .opacity(cameraService.isProcessing12MPPhoto ? 0.65 : 1.0)
                             .animation(.easeInOut(duration: 0.15), value: cameraService.isRecordingVideo)
                     }
@@ -485,6 +503,7 @@ public struct SpektraCamMainView: View {
                     Text(showDarkroomDrawer ? "HIDE LAB" : "DARKROOM")
                         .font(.system(size: 11, weight: .bold, design: .monospaced))
                         .foregroundColor(.white)
+                        .lineLimit(1)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)
                         .background(Color(white: 0.2))

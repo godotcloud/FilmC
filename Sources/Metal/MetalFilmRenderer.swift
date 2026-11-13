@@ -3,12 +3,10 @@
 //  SpektraCam
 //
 //  Datasheet-Grade A15 Bionic Zero-Copy Metal Compute Pipeline Manager
-//  - Per-Stock 18% Neutral Grey Printer Lights Closed-Loop Calibration (`calibrateActiveStockPair`):
-//    Guarantees every film + paper combination renders an 18% grey card cleanly neutral at 0 CC while
-//    preserving each stock's unique H-D toe/shoulder crossover, J-aggregate narrow-band saturation,
-//    Fujifilm 4th cyan layer, and Hanson colored masking couplers!
-//  - Dedicated E-6 Slide Transparency Dye Calibration (`isReversal`): Uses the reversal stock's own
-//    chromogenic dyes under a 5500K light table so Velvia 50 & Provia 100F exhibit true Dmax = 3.65 blacks.
+//  - GPU-Synchronized Video Recording Callback (`onRecordingFrameCompleted` inside `cmdBuf.addCompletedHandler`)
+//    so `AVAssetWriter` only appends a `CVPixelBuffer` AFTER the Metal compute kernel has finished writing to it!
+//  - Per-Stock 18% Neutral Grey Printer Lights Closed-Loop Calibration
+//  - Dedicated E-6 Slide Transparency Dye Calibration (`isReversal`)
 //
 
 import Foundation
@@ -33,7 +31,6 @@ public final class MetalFilmRenderer {
 
     private let bufCIE1931XYZ: MTLBuffer
 
-    // Real-time Viewfinder Working Textures
     private var texSceneLinear: MTLTexture?
     private var texLogEncoded: MTLTexture?
     private var texEmulsionExposure: MTLTexture?
@@ -42,7 +39,6 @@ public final class MetalFilmRenderer {
     private var texFilmRendered: MTLTexture?
     private var currentAllocatedSize: (width: Int, height: Int) = (0, 0)
 
-    // Reusable 12MP Offscreen Ping-Pong Textures
     private let photoRenderLock = NSLock()
     private var texPhotoPing: MTLTexture?
     private var texPhotoPong: MTLTexture?
@@ -62,7 +58,6 @@ public final class MetalFilmRenderer {
     private var cachedPrtSensTable = [SIMD4<Float>](repeating: .zero, count: 81)
     private var cachedPrtDyeTable = [SIMD4<Float>](repeating: .zero, count: 81)
 
-    // Per-pair calibrated Printer Lights scale (ensures 18% grey negative density produces neutral 0.18 print exposure)
     private var activePairPrinterLightsScale = SIMD3<Float>(1.0, 1.0, 1.0)
 
     private var dichroicLobes81 = [SIMD3<Float>](repeating: .zero, count: 81)
@@ -257,8 +252,6 @@ public final class MetalFilmRenderer {
         self.universalPrtDyeScale = calibrateDyeScaleToUnitNeutralDensity(rawDye: rawPrtDye)
     }
 
-    // Calibrates any 3-layer dye set (RA-4 paper, 2383 print film, or E-6 slide transparency)
-    // so that unit Equivalent Neutral Density (END = 1.0, 1.0, 1.0) integrates to exact D65 10% transmittance (18% perceptual grey)!
     private func calibrateDyeScaleToUnitNeutralDensity(rawDye: [SIMD3<Float>]) -> SIMD3<Float> {
         let zeroVec = SIMD3<Float>(0.0, 0.0, 0.0)
         let d65White = SIMD3<Float>(0.95047, 1.00000, 1.08883)
@@ -313,8 +306,6 @@ public final class MetalFilmRenderer {
                 let refIllum = Self.blackbodyNormalized(lambdaNM: lambda, kelvin: negStock.referenceKelvin)
                 refIllumIntegral += negSens[i] * refIllum
             }
-            // Since iPhone ISP auto-white-balances the sensor stream, only apply the user's explicit Kelvin shift
-            // away from 5500K plus a subtle 16% tungsten spectral signature on 3200K stocks so greys don't turn blue!
             let tungstenMix: Float = (negStock.referenceKelvin < 4000.0) ? 0.16 : 0.0
             for i in 0..<81 {
                 let lambda = Float(380 + i * 5)
@@ -331,23 +322,18 @@ public final class MetalFilmRenderer {
         if stockChanged {
             let effNegScale: SIMD3<Float> = negStock.isMonochrome ? SIMD3<Float>(0.38, 0.38, 0.38) : universalNegDyeScale
 
-            // 1. Populate negative dye table and compute this exact stock pair's 18% Middle Grey Printer Lights calibration!
             var midGreyPrtExp = SIMD3<Float>(1e-6, 1e-6, 1e-6)
             for i in 0..<81 {
                 let enlargerIllum = enlargerIllum3200K[i]
                 let scaledNegDye: SIMD3<Float> = simd_max(rawNegDye[i], zeroVec) * effNegScale
                 cachedNegDyeTable[i] = SIMD4<Float>(scaledNegDye.x, scaledNegDye.y, scaledNegDye.z, enlargerIllum)
 
-                // At 18% middle grey, Stage 3 develops `netNegD = (1.0, 1.0, 1.0)`
                 let specD: Float = scaledNegDye.x + scaledNegDye.y + scaledNegDye.z
                 let trans: Float = powf(10.0, -min(max(specD, 0.0), 4.5))
                 midGreyPrtExp += (enlargerIllum * trans) * prtSens[i]
             }
             self.activePairPrinterLightsScale = SIMD3<Float>(0.18, 0.18, 0.18) / midGreyPrtExp
 
-            // 2. Populate scanner dye table:
-            //    - If `negStock.isReversal` (Velvia 50, Provia 100F, Astia 100F, E100), scan the slide's OWN dyes!
-            //    - Otherwise, scan the print stock's dyes (Endura, Crystal Archive, Vision 2383/2393)!
             let sourceDyeToScan = negStock.isReversal ? rawNegDye : rawPrtDye
             let isMonoScan = negStock.isMonochrome || printStock.isMonochrome
             let effScanDyeScale: SIMD3<Float> = isMonoScan
@@ -510,14 +496,15 @@ public final class MetalFilmRenderer {
         inFlightSemaphore.signal()
     }
 
-    // MARK: - 1. Flicker-Free 60fps Viewfinder + Optional Video Recording Render Path
+    // MARK: - 1. Flicker-Free 60fps Viewfinder + GPU-Synchronized Video Recording
     public func renderViewfinderDrawable(
         pixelBuffer: CVPixelBuffer,
         params: FilmSimulationParameters,
         logCurve: LogEncodingTransferFunction,
         drawable: CAMetalDrawable,
         recordingPixelBuffer: CVPixelBuffer? = nil,
-        recordBakedFilm: Bool = true
+        recordBakedFilm: Bool = true,
+        onRecordingFrameCompleted: (() -> Void)? = nil
     ) -> Bool {
         guard let cache = textureCache,
               CVPixelBufferGetPlaneCount(pixelBuffer) >= 2 else {
@@ -568,11 +555,6 @@ public final class MetalFilmRenderer {
               let encoder = cmdBuf.makeComputeCommandEncoder() else {
             inFlightSemaphore.signal()
             return false
-        }
-
-        let semaphore = self.inFlightSemaphore
-        cmdBuf.addCompletedHandler { _ in
-            semaphore.signal()
         }
 
         let tgSize = MTLSize(width: 16, height: 16, depth: 1)
@@ -632,6 +614,7 @@ public final class MetalFilmRenderer {
         encoder.dispatchThreadgroups(dstTGCount, threadsPerThreadgroup: tgSize)
 
         var cvRecordTex: CVMetalTexture?
+        var didEncodeRecording = false
         if let recPB = recordingPixelBuffer {
             let recW = CVPixelBufferGetWidth(recPB)
             let recH = CVPixelBufferGetHeight(recPB)
@@ -652,7 +635,17 @@ public final class MetalFilmRenderer {
                 encoder.setTexture(recordBakedFilm ? texFilm : texLog, index: 0)
                 encoder.setTexture(recMetalTex, index: 1)
                 encoder.dispatchThreadgroups(recTGCount, threadsPerThreadgroup: tgSize)
+                didEncodeRecording = true
             }
+        }
+
+        let semaphore = self.inFlightSemaphore
+        let retainedRecTex = cvRecordTex
+        let recordCallback = didEncodeRecording ? onRecordingFrameCompleted : nil
+        cmdBuf.addCompletedHandler { _ in
+            _ = retainedRecTex
+            semaphore.signal()
+            recordCallback?()
         }
 
         encoder.endEncoding()
