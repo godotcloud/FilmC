@@ -422,7 +422,7 @@ public struct SpektraCamMainView: View {
                 }
                 .padding(8)
             }
-            .frame(height: 118)
+            .frame(height: 146)
             .background(Color(white: 0.09))
             .cornerRadius(10)
         }

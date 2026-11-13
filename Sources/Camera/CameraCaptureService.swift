@@ -53,8 +53,8 @@ public enum VideoRecordingPipelineMode: Int, CaseIterable, Identifiable, Equatab
     public var id: Int { rawValue }
     public var title: String {
         switch self {
-        case .logCleanWithFilmMonitor: return "Clean Log + Film VF"
-        case .bakedPhysicalFilm:       return "Bake Physical Film"
+        case .logCleanWithFilmMonitor: return "Clean Log"
+        case .bakedPhysicalFilm:       return "Baked Film"
         }
     }
 }
