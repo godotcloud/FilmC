@@ -3,10 +3,10 @@
 //  SpektraCam
 //
 //  Native Darkroom UI & ProMotion MetalKit Viewfinder for iPhone 13 Pro Max (6.7" 428x926 pt)
-//  - Fixed Viewfinder Layout: Uses explicit `.layoutPriority(1)` and places `.frame(maxWidth: .infinity, maxHeight: .infinity)`
-//    properly so the 3:4 viewfinder fills the screen cleanly without squishing or letterboxing.
-//  - Single-Line Lens & Film Pill Buttons (`.lineLimit(1)` + `.minimumScaleFactor(0.75)`) so text never wraps onto 2 lines!
-//  - GPU-Completion-Synchronized Video Recording (`onRecordingFrameCompleted`) so `AVAssetWriter` never races with Metal!
+//  - GeometryReader-Driven Explicit Viewfinder Sizing (`availableWidth x (availableWidth * 4/3)` capped to fit):
+//    Guarantees the 3:4 viewfinder ALWAYS fills 100% of the screen width cleanly without SwiftUI
+//    `aspectRatio(.fit)` shrinking it horizontally into a tiny centered square!
+//  - Auto-Adaptive Compact Drawer (`H: 118pt`) + GPU-Synchronized Video Recording
 //
 
 import SwiftUI
@@ -197,43 +197,48 @@ public struct SpektraCamMainView: View {
             VStack(spacing: 6) {
                 topTelemetryHeader
 
-                // Viewfinder Container with `.layoutPriority(1)` so it always claims maximum available screen height
-                ZStack(alignment: .bottom) {
-                    MetalFilmViewfinder(cameraService: cameraService)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .aspectRatio(3.0 / 4.0, contentMode: .fit)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(cameraService.isRecordingVideo ? Color.red : Color.orange.opacity(0.45), lineWidth: cameraService.isRecordingVideo ? 2 : 1)
-                        )
+                // Explicit GeometryReader guarantees full-width 3:4 viewfinder framing without horizontal collapse
+                GeometryReader { geo in
+                    let vfWidth = geo.size.width
+                    let vfHeight = min(geo.size.height, vfWidth * (4.0 / 3.0))
 
-                    HStack(spacing: 6) {
-                        lensSelectorPill
-                        Spacer(minLength: 4)
-                        Button {
-                            let currentNeg = params.negativeStockID
-                            let currentPrt = params.printStockID
-                            var fresh = FilmSimulationParameters()
-                            fresh.negativeStockID = currentNeg
-                            fresh.printStockID = currentPrt
-                            fresh.lensFocalLengthMM = cameraService.activeLens.nominalFocalMM
-                            params = fresh
-                            cameraService.activeParameters = fresh
-                        } label: {
-                            Text("RESET")
-                                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                .foregroundColor(.white)
-                                .lineLimit(1)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 5)
-                                .background(Color.black.opacity(0.68))
-                                .cornerRadius(12)
+                    ZStack(alignment: .bottom) {
+                        MetalFilmViewfinder(cameraService: cameraService)
+                            .frame(width: vfWidth, height: max(vfHeight, 120))
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .stroke(cameraService.isRecordingVideo ? Color.red : Color.orange.opacity(0.45), lineWidth: cameraService.isRecordingVideo ? 2 : 1)
+                            )
+
+                        HStack(spacing: 6) {
+                            lensSelectorPill
+                            Spacer(minLength: 4)
+                            Button {
+                                let currentNeg = params.negativeStockID
+                                let currentPrt = params.printStockID
+                                var fresh = FilmSimulationParameters()
+                                fresh.negativeStockID = currentNeg
+                                fresh.printStockID = currentPrt
+                                fresh.lensFocalLengthMM = cameraService.activeLens.nominalFocalMM
+                                params = fresh
+                                cameraService.activeParameters = fresh
+                            } label: {
+                                Text("RESET")
+                                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.white)
+                                    .lineLimit(1)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 5)
+                                    .background(Color.black.opacity(0.68))
+                                    .cornerRadius(12)
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
+                        .padding(.horizontal, 8)
+                        .padding(.bottom, 8)
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.bottom, 8)
+                    .frame(width: geo.size.width, height: geo.size.height, alignment: .center)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .layoutPriority(1)
@@ -417,7 +422,7 @@ public struct SpektraCamMainView: View {
                 }
                 .padding(8)
             }
-            .frame(height: 132)
+            .frame(height: 118)
             .background(Color(white: 0.09))
             .cornerRadius(10)
         }
