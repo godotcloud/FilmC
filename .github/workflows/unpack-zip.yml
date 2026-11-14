@@ -1,0 +1,73 @@
+name: Unpack SpektraCam ZIP to Repository
+
+on:
+  push:
+    paths:
+      - "SpektraCam-iOS-Full-Project.zip"
+      - "*.zip"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  unpack-zip:
+    name: Extract ZIP Archive to Project Folders
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Unpack ZIP into Target Folders
+        run: |
+          ZIP_FILE=$(ls -1t *.zip 2>/dev/null | head -n 1)
+          if [ -z "$ZIP_FILE" ]; then
+            echo "No .zip file found in repository root."
+            exit 0
+          fi
+
+          echo "Found archive: $ZIP_FILE"
+          rm -rf /tmp/spektracam_extract
+          mkdir -p /tmp/spektracam_extract
+          unzip -oq "$ZIP_FILE" -d /tmp/spektracam_extract
+
+          # Locate extracted SpektraCam root
+          if [ -d "/tmp/spektracam_extract/SpektraCam" ]; then
+            SRC_ROOT="/tmp/spektracam_extract/SpektraCam"
+          else
+            SRC_ROOT="/tmp/spektracam_extract"
+          fi
+
+          # Detect whether this repository keeps Sources/ at root or inside SpektraCam/
+          if [ -f "project.yml" ] && [ ! -d "SpektraCam" ]; then
+            TARGET_DIR="."
+          else
+            TARGET_DIR="SpektraCam"
+            mkdir -p SpektraCam
+          fi
+
+          echo "Syncing extracted files into: $TARGET_DIR"
+          mkdir -p "$TARGET_DIR/Sources"
+          cp -Rf "$SRC_ROOT/Sources/"* "$TARGET_DIR/Sources/"
+          cp -f "$SRC_ROOT/project.yml" "$TARGET_DIR/project.yml"
+
+          # Remove legacy duplicate model files if present
+          rm -f "$TARGET_DIR/Sources/Models/FilmStockParameters.swift"
+          rm -f "$TARGET_DIR/Sources/Models/FilmStockDatabase.swift.bak"
+
+          # Clean up the uploaded zip so the repository stays tidy
+          rm -f "$ZIP_FILE"
+          rm -rf /tmp/spektracam_extract
+
+      - name: Commit and Push Extracted Files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No file changes to commit."
+            exit 0
+          fi
+          git commit -m "chore: unpack SpektraCam-iOS-Full-Project.zip into project folders"
+          git push
