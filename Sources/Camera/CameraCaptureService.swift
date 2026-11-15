@@ -6,6 +6,8 @@
 //  - Unified Continuous Session (Zero `AVCaptureSession` teardown when switching between 12MP Photo & Video modes!)
 //  - Non-Blocking Lock-Protected Video Recording State Machine (Zero `videoWriterQueue.sync` on Main Thread!)
 //  - GPU-Completion-Synchronized `AVAssetWriterInputPixelBufferAdaptor` Append
+//  - Hardware Focus Control: Continuous AutoFocus (AF-C), Tap-to-Focus & Exposure Point of Interest,
+//    and Voice-Coil Motor Manual Focus (`setFocusModeLocked(lensPosition:)` 0.00 Macro to 1.00 Infinity)
 //
 
 import Foundation
@@ -93,6 +95,10 @@ public final class CameraCaptureService: NSObject, ObservableObject {
     @Published public var videoCodec: VideoCodecSelection = .hevc10Bit
     @Published public var statusBannerText: String = "12MP (3024×4032) Spectral Darkroom Ready"
     @Published public var activePixelFormatIs10Bit: Bool = false
+
+    // MARK: - Hardware Focus State (`AF-C` / Tap-to-Focus / Voice-Coil `MF` 0.00–1.00)
+    @Published public var isManualFocusMode: Bool = false
+    @Published public var manualFocusLensPosition: Float = 0.65
 
     public let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "com.spektracam.sessionQueue", qos: .userInitiated)
@@ -250,6 +256,21 @@ public final class CameraCaptureService: NSObject, ObservableObject {
 
         do {
             try cameraDevice.lockForConfiguration()
+            if cameraDevice.isFocusPointOfInterestSupported {
+                cameraDevice.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
+            }
+            if cameraDevice.isFocusModeSupported(.continuousAutoFocus) {
+                cameraDevice.focusMode = .continuousAutoFocus
+            }
+            if cameraDevice.isSmoothAutoFocusSupported {
+                cameraDevice.isSmoothAutoFocusEnabled = true
+            }
+            if cameraDevice.isSubjectAreaChangeMonitoringEnabled != true {
+                cameraDevice.isSubjectAreaChangeMonitoringEnabled = true
+            }
+            if cameraDevice.isExposurePointOfInterestSupported {
+                cameraDevice.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5)
+            }
             if cameraDevice.isExposureModeSupported(.continuousAutoExposure) {
                 cameraDevice.exposureMode = .continuousAutoExposure
             }
@@ -294,6 +315,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
 
         let isVideo = self.isCaptureModeVideo
         DispatchQueue.main.async {
+            self.isManualFocusMode = false
             self.activePixelFormatIs10Bit = false
             self.statusBannerText = isVideo
                 ? "Physical Film & Log Video Ready"
@@ -312,6 +334,97 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         activeParameters = p
         sessionQueue.async { [weak self] in
             self?.configureSession(for: lens)
+        }
+    }
+
+    // MARK: - Hardware Focus & Exposure Point-of-Interest Control
+    /// Converts a tap point in portrait normalized sensor coordinates `(0...1, 0...1)` to hardware AF + AE lock/track
+    public func focusAndExpose(at devicePoint: CGPoint) {
+        let clampedPoint = CGPoint(
+            x: max(0.02, min(0.98, devicePoint.x)),
+            y: max(0.02, min(0.98, devicePoint.y))
+        )
+        sessionQueue.async { [weak self] in
+            guard let self = self,
+                  let device = self.videoDeviceInput?.device else { return }
+            do {
+                try device.lockForConfiguration()
+                if device.isFocusPointOfInterestSupported {
+                    device.focusPointOfInterest = clampedPoint
+                }
+                if device.isFocusModeSupported(.autoFocus) {
+                    device.focusMode = .autoFocus
+                } else if device.isFocusModeSupported(.continuousAutoFocus) {
+                    device.focusMode = .continuousAutoFocus
+                }
+                if device.isExposurePointOfInterestSupported {
+                    device.exposurePointOfInterest = clampedPoint
+                }
+                if device.isExposureModeSupported(.continuousAutoExposure) {
+                    device.exposureMode = .continuousAutoExposure
+                }
+                device.unlockForConfiguration()
+                let currentPos = device.lensPosition
+                DispatchQueue.main.async {
+                    self.isManualFocusMode = false
+                    self.manualFocusLensPosition = currentPos
+                    self.statusBannerText = String(format: "AF/AE Point (%.0f%%, %.0f%%)", clampedPoint.x * 100.0, clampedPoint.y * 100.0)
+                }
+            } catch {}
+        }
+    }
+
+    /// Locks the iPhone 13 Pro Max voice-coil actuator at a specific normalized distance (`0.0` Macro -> `1.0` Infinity)
+    public func setManualFocusLensPosition(_ position: Float) {
+        let clamped = max(0.0, min(1.0, position))
+        DispatchQueue.main.async {
+            self.isManualFocusMode = true
+            self.manualFocusLensPosition = clamped
+        }
+        sessionQueue.async { [weak self] in
+            guard let self = self,
+                  let device = self.videoDeviceInput?.device,
+                  device.isLockingFocusWithCustomLensPositionSupported else { return }
+            do {
+                try device.lockForConfiguration()
+                device.setFocusModeLocked(lensPosition: clamped, completionHandler: nil)
+                device.unlockForConfiguration()
+                DispatchQueue.main.async {
+                    self.statusBannerText = String(format: "Manual Focus Locked: %.2f", clamped)
+                }
+            } catch {}
+        }
+    }
+
+    /// Restores continuous phase-detection autofocus (`AF-C`) across the center of the frame
+    public func resetToContinuousAutoFocus() {
+        DispatchQueue.main.async {
+            self.isManualFocusMode = false
+        }
+        sessionQueue.async { [weak self] in
+            guard let self = self,
+                  let device = self.videoDeviceInput?.device else { return }
+            do {
+                try device.lockForConfiguration()
+                if device.isFocusPointOfInterestSupported {
+                    device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
+                }
+                if device.isFocusModeSupported(.continuousAutoFocus) {
+                    device.focusMode = .continuousAutoFocus
+                }
+                if device.isExposurePointOfInterestSupported {
+                    device.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5)
+                }
+                if device.isExposureModeSupported(.continuousAutoExposure) {
+                    device.exposureMode = .continuousAutoExposure
+                }
+                device.unlockForConfiguration()
+                let currentPos = device.lensPosition
+                DispatchQueue.main.async {
+                    self.manualFocusLensPosition = currentPos
+                    self.statusBannerText = "Continuous AutoFocus (AF-C) Active"
+                }
+            } catch {}
         }
     }
 
@@ -477,7 +590,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
 
             do {
                 let writer = try AVAssetWriter(outputURL: tempURL, fileType: .mov)
-                // 3:4 aspect ratio (960x1280) matches the sensor & viewfinder aspect ratio without cropping
+                // 3:4 aspect ratio (720x960) matches the sensor & viewfinder aspect ratio without cropping
                 let recWidth = 720
                 let recHeight = 960
                 let videoSettings: [String: Any] = [
@@ -550,12 +663,12 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         defer { writerLock.unlock() }
 
         guard isWriterActive,
-              cameraFrameID != lastDequeuedCameraFrameID,
-              let writer = assetWriter,
-              writer.status == .writing,
-              let input = assetWriterVideoInput,
-              input.isReadyForMoreMediaData,
-              let pool = assetWriterPixelBufferAdaptor?.pixelBufferPool else {
+               cameraFrameID != lastDequeuedCameraFrameID,
+               let writer = assetWriter,
+               writer.status == .writing,
+               let input = assetWriterVideoInput,
+               input.isReadyForMoreMediaData,
+               let pool = assetWriterPixelBufferAdaptor?.pixelBufferPool else {
             return nil
         }
 

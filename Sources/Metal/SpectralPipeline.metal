@@ -553,16 +553,24 @@ kernel void kernel_enlarger_print_and_grain(
         float3 logPrintE = log10(max(printExposureRGB, float3(1e-7f)));
 
         float3 spanP = max(u.printDmaxRGB.rgb - u.printDminRGB.rgb, float3(1.8f));
-        float3 pSlope = float3(3.55f) * (u.printGammaRGB.rgb / 2.42f) * u.printGamma;
+        float3 relPaperGamma = pow(clamp(u.printGammaRGB.rgb / 2.42f, float3(0.7f), float3(1.4f)), float3(0.60f));
+        float3 pSlope = float3(2.90f) * relPaperGamma * u.printGamma;
         if (u.isReversalOrMono == 2) {
-            float vcMultiplier = 0.55f + 0.22f * u.bwMultigradeGrade;
+            float vcMultiplier = 0.58f + 0.20f * u.bwMultigradeGrade;
             pSlope *= vcMultiplier;
         }
 
-        // At 18% middle grey (`printExposureRGB = 0.18`, `logPrintE = -0.7447`), `xP = -0.15`, producing exact END = 1.00!
-        float3 xP = logPrintE + 0.7447f - 0.15f;
-        float3 rawPrtD = spanP / (1.0f + exp(-clamp(pSlope * xP, -16.0f, 16.0f)));
-        netPrintOrScanDensity = max(rawPrtD - float3(0.14f), float3(0.0f)) * 1.14f;
+        // Asymmetric print paper H-D curve: soft toe (xP < 0) preserves highlight fabric & skin texture,
+        // while smooth shoulder (xP > 0) gives rich filmic shadow blacks without harsh clipping.
+        float3 xP = logPrintE + 0.7447f - 0.14f;
+        float3 paperAsym;
+        for (int i = 0; i < 3; ++i) {
+            paperAsym[i] = (xP[i] < 0.0f)
+                ? (1.0f / (1.0f - 0.48f * xP[i]))
+                : (1.0f / (1.0f + 0.22f * xP[i]));
+        }
+        float3 rawPrtD = spanP / (1.0f + exp(-clamp(pSlope * paperAsym * xP, -16.0f, 16.0f)));
+        netPrintOrScanDensity = max(rawPrtD - float3(0.08f), float3(0.0f)) * 1.06f;
     } else {
         // Direct Lab Scanner Inversion Path (Noritsu / Frontier CCD Scanner)
         float3 normNeg = clamp(netNegD * 0.5f, 0.0f, 1.0f);

@@ -3,7 +3,16 @@
 //  SpektraCam
 //
 //  Official Datasheet-Calibrated Sensitometry, Asymmetric J-Aggregate Spectral Sensitivity,
-//  Fujifilm 4th Cyan Layer, Hanson Colored Masking Couplers & Distinct Dye Spectral Database
+//  Fujifilm 4th Cyan Layer, Hanson Colored Masking Couplers & 30-Stock Master Database
+//
+//  Includes 30 Camera Film Stocks & 5 Darkroom Print Stocks:
+//  - C-41 Color Negative: Kodak Portra 160 / 400 / 800, Ektar 100, Gold 200, UltraMax 400,
+//    Fujifilm Pro 400H, Superia X-TRA 400, Superia Reala Ace 100, Natura 1600
+//  - ECN-2 Motion Picture Negative: Kodak Vision3 50D (5203), 200T (5213), 250D (5207), 500T (5219),
+//    Kodak Vision 500T (5279), Kodak Vision 800T (5289), Eastman EXR 500T (5298),
+//    Fujifilm Eterna 500T (8573), Fujifilm Eterna Vivid 500T (8547), CineStill 800T & 50D
+//  - E-6 / K-14 Slide Reversal: Kodak Kodachrome 64 (KR), Fujifilm Velvia 50, Provia 100F, Astia 100F, Kodak Ektachrome E100
+//  - B&W Negative: Eastman Double-X 5222 (Cinema B&W), Kodak Tri-X 400, Ilford HP5 Plus 400, Kodak T-Max 100, Fujifilm Acros 100 II
 //
 
 import Foundation
@@ -49,7 +58,6 @@ public struct CameraFilmStock: Identifiable {
     public let halationReflectanceRGB: SIMD3<Float>
     public let defaultEnlargerYMShift: SIMD2<Float>
 
-    // Pre-evaluated 81-band curves (380nm..780nm at 5nm steps)
     public let cachedSensitivities81: [SIMD3<Float>]
     public let cachedDyeDensities81: [SIMD3<Float>]
 
@@ -246,6 +254,7 @@ public struct PrintFilmStock: Identifiable {
 
 public enum FilmStockDatabase {
     public static let cameraStocks: [CameraFilmStock] = [
+        // 1. Kodak Professional Portra & Ektar / Gold / UltraMax (C-41)
         CameraFilmStock(
             id: "kodak_portra_160",
             name: "Kodak Portra 160",
@@ -378,6 +387,8 @@ public enum FilmStockDatabase {
             halationReflectanceRGB: SIMD3<Float>(0.038, 0.007, 0.002),
             defaultEnlargerYMShift: SIMD2<Float>(2.5, 0.5)
         ),
+
+        // 2. Fujifilm 4th Color Layer C-41 Negatives (Pro 400H, Superia 400, Reala Ace 100, Natura 1600)
         CameraFilmStock(
             id: "fujifilm_pro_400h",
             name: "Fujifilm Pro 400H",
@@ -402,6 +413,29 @@ public enum FilmStockDatabase {
             defaultEnlargerYMShift: SIMD2<Float>(-1.5, -1.5)
         ),
         CameraFilmStock(
+            id: "fujifilm_reala_ace_100",
+            name: "Fujifilm Reala Ace 100 (CS)",
+            processType: "C-41 (4th Cyan Layer)",
+            isoSpeed: 100,
+            referenceKelvin: 5500,
+            gammaRGB: SIMD3<Float>(0.59, 0.61, 0.62),
+            dMinRGB: SIMD3<Float>(0.18, 0.54, 0.86),
+            dMaxRGB: SIMD3<Float>(2.12, 2.56, 2.90),
+            toeSoftnessRGB: SIMD3<Float>(0.40, 0.35, 0.34),
+            shoulderSoftnessRGB: SIMD3<Float>(0.54, 0.48, 0.46),
+            rmsGranularity: 5.0,
+            sensPeakNM: SIMD3<Float>(636, 538, 445),
+            sensWidthNM: SIMD3<Float>(24, 22, 22),
+            greenRedCrossTalk: 0.015,
+            fourthCyanLayerStrength: 0.62,
+            dyePeakNM: SIMD3<Float>(646, 540, 444),
+            dyeWidthNM: SIMD3<Float>(47, 38, 35),
+            maskingCouplerEfficiency: 0.93,
+            dirInterlayerMatrix: [1.20, -0.14, -0.06, -0.22, 1.28, -0.06, -0.05, -0.13, 1.18],
+            halationReflectanceRGB: SIMD3<Float>(0.020, 0.004, 0.001),
+            defaultEnlargerYMShift: SIMD2<Float>(-1.0, -1.0)
+        ),
+        CameraFilmStock(
             id: "fujifilm_superia_400",
             name: "Fujifilm Superia X-TRA 400",
             processType: "C-41 (4th Layer)",
@@ -423,6 +457,149 @@ public enum FilmStockDatabase {
             dirInterlayerMatrix: [1.24, -0.16, -0.08, -0.22, 1.30, -0.08, -0.05, -0.15, 1.20],
             halationReflectanceRGB: SIMD3<Float>(0.032, 0.006, 0.001),
             defaultEnlargerYMShift: SIMD2<Float>(-1.5, 1.5)
+        ),
+        CameraFilmStock(
+            id: "fujifilm_natura_1600",
+            name: "Fujifilm Natura 1600",
+            processType: "C-41 (Nano-Σ 4th Layer)",
+            isoSpeed: 1600,
+            referenceKelvin: 5000,
+            gammaRGB: SIMD3<Float>(0.64, 0.68, 0.66),
+            dMinRGB: SIMD3<Float>(0.24, 0.62, 0.96),
+            dMaxRGB: SIMD3<Float>(2.26, 2.68, 2.96),
+            toeSoftnessRGB: SIMD3<Float>(0.45, 0.38, 0.36),
+            shoulderSoftnessRGB: SIMD3<Float>(0.50, 0.44, 0.44),
+            rmsGranularity: 14.5,
+            sensPeakNM: SIMD3<Float>(641, 538, 444),
+            sensWidthNM: SIMD3<Float>(29, 26, 25),
+            greenRedCrossTalk: 0.03,
+            fourthCyanLayerStrength: 0.50,
+            dyePeakNM: SIMD3<Float>(648, 541, 444),
+            dyeWidthNM: SIMD3<Float>(50, 40, 37),
+            maskingCouplerEfficiency: 0.87,
+            dirInterlayerMatrix: [1.18, -0.13, -0.05, -0.18, 1.24, -0.06, -0.04, -0.12, 1.16],
+            halationReflectanceRGB: SIMD3<Float>(0.042, 0.008, 0.002),
+            defaultEnlargerYMShift: SIMD2<Float>(1.5, -1.0)
+        ),
+
+        // 3. Classic Hong Kong & Hollywood Motion Picture Stocks (ECN-2: 5279, 5298, 5289, Vision3, Eterna)
+        CameraFilmStock(
+            id: "kodak_vision_500t_5279",
+            name: "Kodak Vision 500T (5279 · 花样年华)",
+            processType: "ECN-2",
+            isoSpeed: 500,
+            referenceKelvin: 3200,
+            hasAntiHalationRemjet: true,
+            gammaRGB: SIMD3<Float>(0.61, 0.62, 0.64),
+            dMinRGB: SIMD3<Float>(0.20, 0.58, 0.91),
+            dMaxRGB: SIMD3<Float>(2.18, 2.58, 2.92),
+            toeSoftnessRGB: SIMD3<Float>(0.34, 0.33, 0.31),
+            shoulderSoftnessRGB: SIMD3<Float>(0.48, 0.46, 0.44),
+            rmsGranularity: 11.5,
+            sensPeakNM: SIMD3<Float>(652, 547, 443),
+            sensWidthNM: SIMD3<Float>(28, 25, 24),
+            greenRedCrossTalk: 0.035,
+            dyePeakNM: SIMD3<Float>(658, 547, 445),
+            dyeWidthNM: SIMD3<Float>(49, 40, 36),
+            maskingCouplerEfficiency: 0.90,
+            dirInterlayerMatrix: [1.28, -0.20, -0.08, -0.15, 1.24, -0.09, -0.06, -0.16, 1.22],
+            halationReflectanceRGB: SIMD3<Float>(0.015, 0.004, 0.001),
+            defaultEnlargerYMShift: SIMD2<Float>(2.0, 0.5)
+        ),
+        CameraFilmStock(
+            id: "eastman_exr_500t_5298",
+            name: "Eastman EXR 500T (5298 · 重庆森林)",
+            processType: "ECN-2",
+            isoSpeed: 500,
+            referenceKelvin: 3200,
+            hasAntiHalationRemjet: true,
+            gammaRGB: SIMD3<Float>(0.62, 0.64, 0.63),
+            dMinRGB: SIMD3<Float>(0.21, 0.59, 0.92),
+            dMaxRGB: SIMD3<Float>(2.20, 2.62, 2.94),
+            toeSoftnessRGB: SIMD3<Float>(0.32, 0.30, 0.31),
+            shoulderSoftnessRGB: SIMD3<Float>(0.45, 0.43, 0.44),
+            rmsGranularity: 13.0,
+            sensPeakNM: SIMD3<Float>(650, 544, 442),
+            sensWidthNM: SIMD3<Float>(29, 26, 25),
+            greenRedCrossTalk: 0.04,
+            fourthCyanLayerStrength: 0.22,
+            dyePeakNM: SIMD3<Float>(655, 544, 444),
+            dyeWidthNM: SIMD3<Float>(50, 41, 37),
+            maskingCouplerEfficiency: 0.88,
+            dirInterlayerMatrix: [1.26, -0.18, -0.08, -0.18, 1.26, -0.08, -0.06, -0.16, 1.22],
+            halationReflectanceRGB: SIMD3<Float>(0.018, 0.005, 0.001),
+            defaultEnlargerYMShift: SIMD2<Float>(-2.0, -2.5)
+        ),
+        CameraFilmStock(
+            id: "kodak_vision_800t_5289",
+            name: "Kodak Vision 800T (5289 · 暗夜高感)",
+            processType: "ECN-2",
+            isoSpeed: 800,
+            referenceKelvin: 3200,
+            hasAntiHalationRemjet: true,
+            gammaRGB: SIMD3<Float>(0.63, 0.64, 0.66),
+            dMinRGB: SIMD3<Float>(0.22, 0.60, 0.94),
+            dMaxRGB: SIMD3<Float>(2.22, 2.64, 2.96),
+            toeSoftnessRGB: SIMD3<Float>(0.33, 0.32, 0.30),
+            shoulderSoftnessRGB: SIMD3<Float>(0.46, 0.44, 0.42),
+            rmsGranularity: 13.5,
+            sensPeakNM: SIMD3<Float>(652, 548, 444),
+            sensWidthNM: SIMD3<Float>(30, 27, 25),
+            greenRedCrossTalk: 0.045,
+            dyePeakNM: SIMD3<Float>(658, 548, 446),
+            dyeWidthNM: SIMD3<Float>(51, 41, 37),
+            maskingCouplerEfficiency: 0.88,
+            dirInterlayerMatrix: [1.26, -0.19, -0.07, -0.14, 1.23, -0.09, -0.06, -0.15, 1.21],
+            halationReflectanceRGB: SIMD3<Float>(0.016, 0.004, 0.001),
+            defaultEnlargerYMShift: SIMD2<Float>(1.5, 0.5)
+        ),
+        CameraFilmStock(
+            id: "fujifilm_eterna_500t_8573",
+            name: "Fujifilm Eterna 500T (8573)",
+            processType: "ECN-2",
+            isoSpeed: 500,
+            referenceKelvin: 3200,
+            hasAntiHalationRemjet: true,
+            gammaRGB: SIMD3<Float>(0.53, 0.55, 0.56),
+            dMinRGB: SIMD3<Float>(0.18, 0.55, 0.87),
+            dMaxRGB: SIMD3<Float>(2.02, 2.46, 2.80),
+            toeSoftnessRGB: SIMD3<Float>(0.44, 0.40, 0.38),
+            shoulderSoftnessRGB: SIMD3<Float>(0.60, 0.55, 0.52),
+            rmsGranularity: 9.5,
+            sensPeakNM: SIMD3<Float>(642, 539, 443),
+            sensWidthNM: SIMD3<Float>(27, 24, 24),
+            greenRedCrossTalk: 0.025,
+            fourthCyanLayerStrength: 0.45,
+            dyePeakNM: SIMD3<Float>(649, 541, 444),
+            dyeWidthNM: SIMD3<Float>(49, 40, 36),
+            maskingCouplerEfficiency: 0.91,
+            dirInterlayerMatrix: [1.18, -0.13, -0.05, -0.18, 1.24, -0.06, -0.05, -0.12, 1.17],
+            halationReflectanceRGB: SIMD3<Float>(0.008, 0.002, 0.001),
+            defaultEnlargerYMShift: SIMD2<Float>(-2.0, -1.5)
+        ),
+        CameraFilmStock(
+            id: "fujifilm_eterna_vivid_500t_8547",
+            name: "Fujifilm Eterna Vivid 500T (8547 · 银河映像)",
+            processType: "ECN-2",
+            isoSpeed: 500,
+            referenceKelvin: 3200,
+            hasAntiHalationRemjet: true,
+            gammaRGB: SIMD3<Float>(0.63, 0.65, 0.66),
+            dMinRGB: SIMD3<Float>(0.19, 0.56, 0.89),
+            dMaxRGB: SIMD3<Float>(2.22, 2.66, 2.98),
+            toeSoftnessRGB: SIMD3<Float>(0.30, 0.28, 0.28),
+            shoulderSoftnessRGB: SIMD3<Float>(0.44, 0.42, 0.40),
+            rmsGranularity: 10.5,
+            sensPeakNM: SIMD3<Float>(644, 539, 443),
+            sensWidthNM: SIMD3<Float>(26, 23, 23),
+            greenRedCrossTalk: 0.02,
+            fourthCyanLayerStrength: 0.50,
+            dyePeakNM: SIMD3<Float>(650, 541, 443),
+            dyeWidthNM: SIMD3<Float>(47, 38, 35),
+            maskingCouplerEfficiency: 0.92,
+            dirInterlayerMatrix: [1.30, -0.22, -0.08, -0.22, 1.30, -0.08, -0.06, -0.18, 1.24],
+            halationReflectanceRGB: SIMD3<Float>(0.009, 0.002, 0.001),
+            defaultEnlargerYMShift: SIMD2<Float>(-1.0, -1.0)
         ),
         CameraFilmStock(
             id: "kodak_vision3_50d",
@@ -562,6 +739,29 @@ public enum FilmStockDatabase {
             halationReflectanceRGB: SIMD3<Float>(0.145, 0.028, 0.003),
             defaultEnlargerYMShift: SIMD2<Float>(1.5, 0.5)
         ),
+
+        // 4. Slide Reversal Films (K-14 Kodachrome & E-6 Velvia / Provia / Astia / E100)
+        CameraFilmStock(
+            id: "kodak_kodachrome_64",
+            name: "Kodak Kodachrome 64 (KR · K-14)",
+            processType: "K-14 Reversal",
+            isoSpeed: 64,
+            referenceKelvin: 5500,
+            isReversal: true,
+            gammaRGB: SIMD3<Float>(1.62, 1.58, 1.50),
+            dMinRGB: SIMD3<Float>(0.08, 0.09, 0.11),
+            dMaxRGB: SIMD3<Float>(3.75, 3.68, 3.52),
+            toeSoftnessRGB: SIMD3<Float>(0.18, 0.19, 0.22),
+            shoulderSoftnessRGB: SIMD3<Float>(0.22, 0.24, 0.28),
+            rmsGranularity: 7.5,
+            sensPeakNM: SIMD3<Float>(650, 544, 442),
+            sensWidthNM: SIMD3<Float>(21, 19, 19),
+            greenRedCrossTalk: 0.012,
+            dyePeakNM: SIMD3<Float>(654, 542, 445),
+            dyeWidthNM: SIMD3<Float>(42, 35, 32),
+            dirInterlayerMatrix: [1.34, -0.24, -0.10, -0.20, 1.32, -0.12, -0.08, -0.20, 1.28],
+            halationReflectanceRGB: SIMD3<Float>(0.012, 0.002, 0.001)
+        ),
         CameraFilmStock(
             id: "fujifilm_velvia_50",
             name: "Fujifilm Velvia 50 (RVP50)",
@@ -645,6 +845,26 @@ public enum FilmStockDatabase {
             dyeWidthNM: SIMD3<Float>(46, 38, 35),
             dirInterlayerMatrix: [1.26, -0.18, -0.08, -0.15, 1.24, -0.09, -0.07, -0.17, 1.24],
             halationReflectanceRGB: SIMD3<Float>(0.018, 0.003, 0.001)
+        ),
+
+        // 5. Silver Halide Black & White Negative (Double-X 5222, Tri-X 400, HP5 Plus, T-Max 100, Acros 100 II)
+        CameraFilmStock(
+            id: "eastman_double_x_5222",
+            name: "Eastman Double-X 5222 (Cinema B&W)",
+            processType: "B&W D-96 Cinema",
+            isoSpeed: 250,
+            referenceKelvin: 5500,
+            isMonochrome: true,
+            gammaRGB: SIMD3<Float>(0.65, 0.65, 0.65),
+            dMinRGB: SIMD3<Float>(0.14, 0.14, 0.14),
+            dMaxRGB: SIMD3<Float>(2.32, 2.32, 2.32),
+            toeSoftnessRGB: SIMD3<Float>(0.30, 0.30, 0.30),
+            shoulderSoftnessRGB: SIMD3<Float>(0.36, 0.36, 0.36),
+            rmsGranularity: 14.5,
+            sensPeakNM: SIMD3<Float>(522, 522, 522),
+            sensWidthNM: SIMD3<Float>(86, 86, 86),
+            dirInterlayerMatrix: [1, 0, 0, 0, 1, 0, 0, 0, 1],
+            halationReflectanceRGB: SIMD3<Float>(0.038, 0.038, 0.038)
         ),
         CameraFilmStock(
             id: "kodak_tri_x_400",
