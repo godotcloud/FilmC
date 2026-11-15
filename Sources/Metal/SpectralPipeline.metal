@@ -5,13 +5,14 @@
 //  Datasheet-Grade Physical Optics, Sensitometry & Photochemical Darkroom Compute Pipeline
 //  Optimized for Apple A15 Bionic (iPhone 13 Pro Max 5-Core GPU, Unified 6GB LPDDR4X)
 //
-//  DATASHEET-GRADE PHYSICAL UPGRADES:
-//  1. Inverse-ISP Highlight Shoulder Reconstruction (`hlBoost` above linear 0.42) + Unbounded Square-Root Soft-Knee
-//     Hurter-Driffield curves (`rsqrt(1.0 + a * abs(x))`) so bright backlit windows reach luminous, warm paper-base white
-//     (0.94-0.97 sRGB) without chalky cyan-grey capping, while shadows reach deep velvety Dmax blacks (0.03-0.06 sRGB).
-//  2. Authentic Negative-to-Print Crossover Calibration: Ensures Cyan print dye drops cleanly in highlights while
-//     Yellow/Magenta retain a delicate warm ivory highlight toe and cool-velvet shadow depth.
-//  3. True Silver-Retention S-Curve Bleach Bypass (`agContrastD` pivoted at D=0.62) & Edge-Contrast-Gated Dual-Scale Halation.
+//  MASTER CINEMATOGRAPHY UPGRADES (WONG KAR-WAI / CHRISTOPHER DOYLE & JOHNNIE TO / CHENG SIU-KEUNG):
+//  1. Kinoptik Tegea 9.8mm f/1.8 + Century 6.8mm Wide-Angle Adapter Optical Barrel Distortion & Rare-Earth Glass
+//     Lateral Chromatic Dispersion (`cinemaOpticsAndStep.x` in Stage 1).
+//  2. Christopher Doyle 6fps-12fps Step-Printing Optical Printer Temporal Shutter Trail (`cinemaOpticsAndStep.y` in Stage 0).
+//  3. E-6 / ECN-2 Cross-Processing Nonlinear Channel Warp (`cinemaSplitTone.w`) & Milkyway Image Chiaroscuro Hard-Light
+//     Noir Shadow Toe & Micro-Contrast (`chiaroscuroContrast` in Stage 3).
+//  4. Dual-Illuminant Spectral Split-Lighting (`cinemaSplitTone.xyz` in Stage 4): Models uncorrected mercury-vapor/fluorescent
+//     emerald-green or HMI electric-blue ambient shadows alongside 2600K-3000K tungsten/sodium-vapor golden highlights!
 //
 
 #include <metal_stdlib>
@@ -68,7 +69,10 @@ struct MetalFilmUniforms {
     int outputColorSpace;
     int isReversalOrMono;
     float bwMultigradeGrade;
-    float padding0;
+    float chiaroscuroContrast;
+
+    float4 cinemaSplitTone;
+    float4 cinemaOpticsAndStep;
 };
 
 constant float LOG2_10 = 3.321928095f;
@@ -101,9 +105,6 @@ inline float3 compute_jakob_hanika_coeffs(float3 rgb_linear, thread float &albed
     return float3(c0, c1, c2);
 }
 
-// Per-channel asymmetric Hurter-Driffield curve pivoted at 18% middle grey (log10(0.18) = -0.7447 -> norm = 0.50)
-// Uses unbounded square-root soft-knee (`rsqrt(1 + a * |x|)`) so `k * x` grows monotonically as `sign(x) * sqrt(|x|)`,
-// reaching true Dmin (0.0) in deep shadows and true Dmax (1.0) in bright backlit windows!
 inline float3 evaluate_hd_normalized(
     float3 logE,
     float3 gamma,
@@ -206,15 +207,17 @@ inline float3 encode_custom_log(float3 linearRGB, int logMode) {
 }
 
 // ============================================================================
-// Stage 0: Resolution-Adaptive YCbCr -> Scene-Linear + Log
+// Stage 0: Resolution-Adaptive YCbCr -> Scene-Linear + Step-Printing + Log
 // ============================================================================
 kernel void kernel_ycbcr10_to_scene_linear_and_log(
     texture2d<float, access::read> lumaPlane [[texture(0)]],
     texture2d<float, access::read> chromaPlane [[texture(1)]],
     texture2d<float, access::write> outSceneLinear [[texture(2)]],
     texture2d<float, access::write> outLogEncoded [[texture(3)]],
+    texture2d<float, access::read_write> ioStepPrintAccum [[texture(4)]],
     constant int &logMode [[buffer(0)]],
     constant int &is10BitInput [[buffer(1)]],
+    constant float &stepPrintTrail [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     uint dstW = outSceneLinear.get_width();
@@ -266,14 +269,26 @@ kernel void kernel_ycbcr10_to_scene_linear_and_log(
         );
     }
 
+    // Christopher Doyle 6fps-12fps Step-Printing Optical Printer Shutter Trail (Chungking Express / Fallen Angels)
+    if (stepPrintTrail > 0.01f) {
+        float3 prevAccum = ioStepPrintAccum.read(gid).rgb;
+        float alpha = clamp(stepPrintTrail * 0.82f, 0.0f, 0.86f);
+        float3 blended = mix(sceneLinear, prevAccum, alpha);
+        // Preserve luminous neon streaks on moving lights (180-deg slow-shutter integration)
+        sceneLinear = mix(blended, max(blended, sceneLinear * 0.88f), 0.35f);
+        ioStepPrintAccum.write(float4(sceneLinear, 1.0f), gid);
+    } else {
+        ioStepPrintAccum.write(float4(sceneLinear, 1.0f), gid);
+    }
+
     outSceneLinear.write(float4(sceneLinear, 1.0f), gid);
     float3 logRGB = encode_custom_log(sceneLinear, logMode);
     outLogEncoded.write(float4(logRGB, 1.0f), gid);
 }
 
 // ============================================================================
-// Stage 1: Inverse-ISP Highlight Decompression, Spectral Upsampling (380nm - 780nm)
-//          & Emulsion Spectral Integration
+// Stage 1: Kinoptik 9.8mm Barrel Distortion & Dispersion, Inverse-ISP Highlight
+//          Decompression, & 81-Band Spectral Emulsion Integration
 // ============================================================================
 kernel void kernel_spectral_upsample_and_expose(
     texture2d<float, access::read> inSceneLinear [[texture(0)]],
@@ -286,19 +301,46 @@ kernel void kernel_spectral_upsample_and_expose(
     uint height = outEmulsionExposure.get_height();
     if (gid.x >= width || gid.y >= height) return;
 
-    float3 baseLin = max(inSceneLinear.read(gid).rgb, float3(1e-6f));
+    float2 normCenterUV = (float2(gid) + 0.5f) / float2(float(width), float(height));
+    float2 p = normCenterUV * 2.0f - 1.0f;
+    float aspect = float(width) / float(max(height, 1u));
+    float2 pMetric = float2(p.x * aspect, p.y);
+    float rSq = dot(pMetric, pMetric);
+
+    float3 baseLin;
+    float wideDistort = u.cinemaOpticsAndStep.x;
+    if (wideDistort > 0.005f) {
+        // Kinoptik Tegea 9.8mm f/1.8 + Century 6.8mm wide-angle adapter Brown-Conrady barrel distortion
+        // + rare-earth glass lateral chromatic dispersion at peripheral corners
+        float k1 = 0.24f * wideDistort;
+        float normScale = 1.0f / (1.0f + k1 * 0.72f);
+        float radialFactor = (1.0f + k1 * rSq * 0.45f) * normScale;
+        float disp = 0.0085f * wideDistort * rSq * 0.45f;
+
+        float2 uvR = clamp((p * (radialFactor + disp)) * 0.5f + 0.5f, float2(0.0f), float2(1.0f));
+        float2 uvG = clamp((p * radialFactor) * 0.5f + 0.5f, float2(0.0f), float2(1.0f));
+        float2 uvB = clamp((p * (radialFactor - disp)) * 0.5f + 0.5f, float2(0.0f), float2(1.0f));
+
+        uint2 coordR = uint2(clamp(uint(uvR.x * float(width)), 0u, width - 1u), clamp(uint(uvR.y * float(height)), 0u, height - 1u));
+        uint2 coordG = uint2(clamp(uint(uvG.x * float(width)), 0u, width - 1u), clamp(uint(uvG.y * float(height)), 0u, height - 1u));
+        uint2 coordB = uint2(clamp(uint(uvB.x * float(width)), 0u, width - 1u), clamp(uint(uvB.y * float(height)), 0u, height - 1u));
+
+        baseLin = max(float3(
+            inSceneLinear.read(coordR).r,
+            inSceneLinear.read(coordG).g,
+            inSceneLinear.read(coordB).b
+        ), float3(1e-6f));
+    } else {
+        baseLin = max(inSceneLinear.read(gid).rgb, float3(1e-6f));
+    }
+
     // Reconstruct true scene highlight dynamic range above linear 0.42 (sRGB 0.68) compressed by iPhone ISP
-    // so bright backlit windows and lamps drive the film emulsion +3.5 to +4.8 stops above 18% grey
     float peakLin = max(max(baseLin.r, baseLin.g), baseLin.b);
     float hlKnee = max(peakLin - 0.42f, 0.0f) * (1.0f / 0.58f);
     float hlBoost = 1.0f + 3.40f * pow(hlKnee, 1.85f);
     float3 rgb = baseLin * hlBoost * u.exposureScale;
 
-    float2 uv = (float2(gid) / float2(width, height)) * 2.0f - 1.0f;
-    float aspect = float(width) / float(max(height, 1u));
-    uv.x *= aspect;
-    float rSq = dot(uv, uv) * 0.25f;
-    float cosThetaSq = 1.0f / (1.0f + rSq);
+    float cosThetaSq = 1.0f / (1.0f + rSq * 0.25f);
     float vignette = mix(1.0f, cosThetaSq * cosThetaSq, u.opticalVignetteStrength);
     rgb *= vignette;
 
@@ -408,8 +450,8 @@ kernel void kernel_halation_and_scatter(
 }
 
 // ============================================================================
-// Stage 3: Per-Channel Asymmetric Hurter-Driffield Development, Push/Pull &
-//          3x3 DIR Coupler Interlayer Matrix (Neutral-Grey Invariant)
+// Stage 3: Hurter-Driffield Development, Chiaroscuro Hard-Light Toe,
+//          E-6/ECN-2 Cross-Processing & 3x3 DIR Couplers
 // ============================================================================
 kernel void kernel_develop_and_dir_couplers(
     texture2d<float, access::read> inScatteredExposure [[texture(0)]],
@@ -445,11 +487,28 @@ kernel void kernel_develop_and_dir_couplers(
     float3 normSurround = 0.25f * (normN + normS + normE + normW);
     float3 normLaplacian = normCenter - normSurround;
 
+    float microContrastGain = 0.18f + 0.14f * u.chiaroscuroContrast;
     float3 normCoupled = float3(
         dot(u.dirCouplerMatrixRow0.xyz, normCenter),
         dot(u.dirCouplerMatrixRow1.xyz, normCenter),
         dot(u.dirCouplerMatrixRow2.xyz, normCenter)
-    ) + 0.18f * normLaplacian;
+    ) + microContrastGain * normLaplacian;
+
+    // 1. Milkyway Image (Cheng Siu-keung) Chiaroscuro Shadow Toe Deepening (PTU / Election / Exiled)
+    if (!isReversal && u.chiaroscuroContrast > 0.001f) {
+        float lumaN = dot(normCoupled, float3(0.30f, 0.55f, 0.15f));
+        float shadowPull = u.chiaroscuroContrast * 0.22f * max(0.52f - lumaN, 0.0f) * clamp(lumaN / 0.52f, 0.0f, 1.0f);
+        normCoupled = clamp(normCoupled - float3(shadowPull), 0.0f, 1.0f);
+    }
+
+    // 2. E-6 / ECN-2 Cross-Processing Nonlinear S-Curve Channel Warp (Fallen Angels / Happy Together)
+    float crossP = u.cinemaSplitTone.w;
+    if (!isReversal && crossP > 0.001f) {
+        float cpR = normCoupled.x + 0.14f * sin((normCoupled.x - 0.45f) * 3.14159265f);
+        float cpG = normCoupled.y - 0.06f * (1.0f - normCoupled.y) * normCoupled.y * 4.0f;
+        float cpB = normCoupled.z - 0.14f * sin((normCoupled.z - 0.50f) * 3.14159265f);
+        normCoupled = mix(normCoupled, clamp(float3(cpR, cpG, cpB), 0.0f, 1.0f), crossP);
+    }
 
     float meanSurround = dot(normSurround, float3(0.333333f));
     float exhFactor = 1.0f / (1.0f + 0.30f * u.developerExhaustion * max(meanSurround - 0.50f, 0.0f));
@@ -467,7 +526,8 @@ kernel void kernel_develop_and_dir_couplers(
 }
 
 // ============================================================================
-// Stage 4: Virtual Enlarger, RA-4 / 2383 Print, E-6 Light-Table Scan & Grain
+// Stage 4: Virtual Enlarger, Dual-Illuminant Split-Toning (Mercury/HMI Shadows
+//          vs Tungsten/Sodium Highlights), RA-4 / 2383 Print & Grain
 // ============================================================================
 kernel void kernel_enlarger_print_and_grain(
     texture2d<float, access::read> inNegativeDensityCMY [[texture(0)]],
@@ -531,9 +591,24 @@ kernel void kernel_enlarger_print_and_grain(
     bool isReversal = (u.isReversalOrMono == 1);
     float3 netPrintOrScanDensity = float3(0.0f);
 
+    // Dual-Illuminant Split-Lighting Zone Weights (based on normalized negative density `normNegLuma in [0, 1]`)
+    float normNegLuma = clamp(dot(netNegD * 0.5f, float3(0.30f, 0.55f, 0.15f)), 0.0f, 1.0f);
+    float shWeight = pow(clamp(1.0f - normNegLuma * 1.45f, 0.0f, 1.0f), 1.25f);
+    float hlWeight = smoothstep(0.34f, 0.86f, normNegLuma) * clamp((0.96f - normNegLuma) / 0.18f, 0.25f, 1.0f);
+
+    float shGM   = u.cinemaSplitTone.x; // +Green / -Magenta in shadows (Mercury-vapor / fluorescent tubes)
+    float shTR   = u.cinemaSplitTone.y; // +Teal-Blue / -Red in shadows (PTU electric blue night vs ITMFL crimson shadow)
+    float hlGold = u.cinemaSplitTone.z; // +Amber-Gold tungsten practical lamps in upper-midtones & highlights
+
+    float3 zoneLogPrintShift = float3(
+        shWeight * (0.24f * shTR + 0.08f * shGM) - hlWeight * (0.22f * hlGold),
+        shWeight * (-0.26f * shGM + 0.04f * shTR) + hlWeight * (0.09f * hlGold),
+        shWeight * (-0.22f * shTR + 0.10f * shGM) + hlWeight * (0.28f * hlGold)
+    );
+
     if (isReversal) {
         float3 tintOffset = float3(u.dichroicFilterCMY.x, u.dichroicFilterCMY.y, u.dichroicFilterCMY.z) * 0.005f;
-        netPrintOrScanDensity = max(netNegD / max(u.printExposureScale, 0.1f) + tintOffset, float3(0.0f));
+        netPrintOrScanDensity = max(netNegD / max(u.printExposureScale, 0.1f) + tintOffset + zoneLogPrintShift * 0.8f, float3(0.0f));
     } else if (u.printPipelineMode == 0) {
         float3 printExposureRGB = float3(0.0f);
         for (int i = 0; i < 81; ++i) {
@@ -544,20 +619,17 @@ kernel void kernel_enlarger_print_and_grain(
         }
 
         printExposureRGB = printExposureRGB * u.printExposureScale + float3(u.preflashLinearAddition);
-        float3 logPrintE = log10(max(printExposureRGB, float3(1e-7f)));
+        float3 logPrintE = log10(max(printExposureRGB, float3(1e-7f))) + zoneLogPrintShift;
 
         float3 spanP = max(u.printDmaxRGB.rgb - u.printDminRGB.rgb, float3(1.9f));
         float meanPrtG = (u.printGammaRGB.r + u.printGammaRGB.g + u.printGammaRGB.b) * 0.333333f;
         float baseSlope = 3.25f * pow(clamp(meanPrtG / 2.42f, 0.75f, 1.45f), 0.55f) * u.printGamma;
-        // Authentic RA-4 / 2383 / 2393 layer slope balance: Cyan (x) clears cleanly in highlights while Yellow (z) retains warm creamy ivory
         float3 pSlope = float3(baseSlope * 1.03f, baseSlope * 1.00f, baseSlope * 0.96f);
         if (u.isReversalOrMono == 2) {
             float vcMultiplier = 0.58f + 0.20f * u.bwMultigradeGrade;
             pSlope = float3(baseSlope * vcMultiplier);
         }
 
-        // Unbounded square-root soft-knee print paper H-D curve anchored so 18% grey lands at natural brightness
-        // while bright backlit windows reach clean, warm paper-base white (D -> 0) and shadows reach full Dmax!
         float3 xP = logPrintE + 0.7447f - 0.17f;
         const float3 paperToeSoft  = float3(0.14f, 0.17f, 0.22f);
         const float3 paperShldSoft = float3(0.14f, 0.15f, 0.17f);
@@ -574,12 +646,10 @@ kernel void kernel_enlarger_print_and_grain(
         float3 stretched = clamp((normNeg - 0.10f) / 0.80f, 0.0f, 1.0f);
         float3 invNorm = pow(1.0f - stretched, float3(1.12f * u.printGamma));
         float3 tintOffset = float3(u.dichroicFilterCMY.x, u.dichroicFilterCMY.y, u.dichroicFilterCMY.z) * 0.0055f;
-        netPrintOrScanDensity = max((invNorm * 2.00f) / max(u.printExposureScale, 0.2f) + tintOffset, float3(0.0f));
+        netPrintOrScanDensity = max((invNorm * 2.00f) / max(u.printExposureScale, 0.2f) + tintOffset + zoneLogPrintShift, float3(0.0f));
     }
 
     if (u.bleachBypassAmount > 0.001f) {
-        // Photochemical Silver Retention (ENR / ACE): metallic silver S-curve pivoted at D = 0.62
-        // Keeps highlights luminous & metallic while deepening shadow silver density and contrast
         float agLumaD = dot(netPrintOrScanDensity, float3(0.30f, 0.55f, 0.15f));
         float agContrastD = max(agLumaD + 0.36f * (agLumaD - 0.62f), 0.0f);
         float3 desatPrintD = mix(netPrintOrScanDensity, float3(agContrastD), 0.68f);

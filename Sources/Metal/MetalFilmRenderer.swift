@@ -32,6 +32,7 @@ public final class MetalFilmRenderer {
     private let bufCIE1931XYZ: MTLBuffer
 
     private var texSceneLinear: MTLTexture?
+    private var texStepPrintAccum: MTLTexture?
     private var texLogEncoded: MTLTexture?
     private var texEmulsionExposure: MTLTexture?
     private var texScatteredExposure: MTLTexture?
@@ -141,6 +142,7 @@ public final class MetalFilmRenderer {
         desc.storageMode = .private
 
         self.texSceneLinear = device.makeTexture(descriptor: desc)
+        self.texStepPrintAccum = device.makeTexture(descriptor: desc)
         self.texLogEncoded = device.makeTexture(descriptor: desc)
         self.texEmulsionExposure = device.makeTexture(descriptor: desc)
         self.texScatteredExposure = device.makeTexture(descriptor: desc)
@@ -495,7 +497,20 @@ public final class MetalFilmRenderer {
             rmsGranularityRGB: SIMD4<Float>(negStock.rmsGranularity, negStock.rmsGranularity, negStock.rmsGranularity * 1.15, 0),
             outputColorSpace: Int32(params.outputColorSpace.rawValue),
             isReversalOrMono: modeFlag,
-            bwMultigradeGrade: params.bwMultigradeFilterGrade
+            bwMultigradeGrade: params.bwMultigradeFilterGrade,
+            chiaroscuroContrast: params.chiaroscuroContrast,
+            cinemaSplitTone: SIMD4<Float>(
+                params.shadowSplitGreenMagenta,
+                params.shadowSplitTealRed,
+                params.highlightWarmthGold,
+                params.crossProcessAmount
+            ),
+            cinemaOpticsAndStep: SIMD4<Float>(
+                params.wideAngleDistortion,
+                params.stepPrintTrail,
+                0.0,
+                0.0
+            )
         )
 
         return (uniforms, tables.sens, tables.negDye, tables.prtSens, tables.prtDye)
@@ -543,6 +558,7 @@ public final class MetalFilmRenderer {
         ensureTransientTextures(width: workW, height: workH)
 
         guard let texLinear = texSceneLinear,
+              let texStepAccum = texStepPrintAccum,
               let texLog = texLogEncoded,
               let texExp = texEmulsionExposure,
               let texScat = texScatteredExposure,
@@ -576,13 +592,16 @@ public final class MetalFilmRenderer {
 
         var logModeRaw = Int32(logCurve.rawValue)
         var is10BitFlag: Int32 = is10Bit ? 1 : 0
+        var stepPrintVal: Float = params.stepPrintTrail
         encoder.setComputePipelineState(pipeYCbCr10ToLinearAndLog)
         encoder.setTexture(lumaTex, index: 0)
         encoder.setTexture(chromaTex, index: 1)
         encoder.setTexture(texLinear, index: 2)
         encoder.setTexture(texLog, index: 3)
+        encoder.setTexture(texStepAccum, index: 4)
         encoder.setBytes(&logModeRaw, length: MemoryLayout<Int32>.stride, index: 0)
         encoder.setBytes(&is10BitFlag, length: MemoryLayout<Int32>.stride, index: 1)
+        encoder.setBytes(&stepPrintVal, length: MemoryLayout<Float>.stride, index: 2)
         encoder.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
 
         var pack = buildMetalUniformsAndTables(params: params, imageWidth: workW)

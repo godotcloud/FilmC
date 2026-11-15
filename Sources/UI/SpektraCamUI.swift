@@ -232,6 +232,7 @@ private struct FilmStockCarouselStrip: View {
 }
 
 public enum DarkroomInspectorTab: String, CaseIterable, Identifiable {
+    case cinemaFX = "★ Cinema Master"
     case exposure = "① Exposure & Focus"
     case optics   = "② Bloom"
     case couplers = "③ DIR & Push"
@@ -607,6 +608,15 @@ public struct SpektraCamMainView: View {
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 7) {
                     switch selectedTab {
+                    case .cinemaFX:
+                        paramSlider(title: "Shadow Mercury Green / Magenta", value: $params.shadowSplitGreenMagenta, range: -1.0...1.0, unit: "")
+                        paramSlider(title: "Shadow Electric Blue / Crimson", value: $params.shadowSplitTealRed, range: -1.0...1.0, unit: "")
+                        paramSlider(title: "Highlight Tungsten Amber Gold", value: $params.highlightWarmthGold, range: -1.0...1.0, unit: "")
+                        paramSlider(title: "Milkyway Chiaroscuro Noir Toe", value: $params.chiaroscuroContrast, range: 0.0...1.0, unit: "")
+                        paramSlider(title: "E-6/ECN-2 Cross-Process Warp", value: $params.crossProcessAmount, range: 0.0...1.0, unit: "")
+                        paramSlider(title: "Kinoptik 9.8mm Barrel Distortion", value: $params.wideAngleDistortion, range: 0.0...1.0, unit: "")
+                        paramSlider(title: "Doyle Step-Printing Trail (8fps)", value: $params.stepPrintTrail, range: 0.0...1.0, unit: "")
+
                     case .exposure:
                         HStack(spacing: 8) {
                             Text("Focus Mode")
