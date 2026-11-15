@@ -45,7 +45,7 @@ public final class MetalFilmRenderer {
     private var texPhotoPong: MTLTexture?
     private var currentPhotoSize: (width: Int, height: Int) = (0, 0)
 
-    private let inFlightSemaphore = DispatchSemaphore(value: 2)
+    private let inFlightSemaphore = DispatchSemaphore(value: 3)
     private let tableLock = NSLock()
 
     private var frameCounter: UInt32 = 1
@@ -372,7 +372,8 @@ public final class MetalFilmRenderer {
 
     public func buildMetalUniformsAndTables(
         params: FilmSimulationParameters,
-        imageWidth: Int
+        imageWidth: Int,
+        isRealtimeFastMode: Bool = true
     ) -> (
         uniforms: MetalFilmUniforms,
         sens: [SIMD4<Float>],
@@ -508,7 +509,7 @@ public final class MetalFilmRenderer {
             cinemaOpticsAndStep: SIMD4<Float>(
                 params.wideAngleDistortion,
                 params.stepPrintTrail,
-                0.0,
+                isRealtimeFastMode ? 1.0 : 0.0,
                 0.0
             )
         )
@@ -641,9 +642,12 @@ public final class MetalFilmRenderer {
         let dstH = outDrawableTex.height
         let dstTGCount = MTLSize(width: (dstW + 15) / 16, height: (dstH + 15) / 16, depth: 1)
 
+        var injectVFDetail: Int32 = (params.wideAngleDistortion > 0.01 || params.stepPrintTrail > 0.01) ? 0 : 1
         encoder.setComputePipelineState(pipePresentOrRecordBGRA8)
         encoder.setTexture(texFilm, index: 0)
         encoder.setTexture(outDrawableTex, index: 1)
+        encoder.setTexture(lumaTex, index: 2)
+        encoder.setBytes(&injectVFDetail, length: MemoryLayout<Int32>.stride, index: 0)
         encoder.dispatchThreadgroups(dstTGCount, threadsPerThreadgroup: tgSize)
 
         var cvRecordTex: CVMetalTexture?
@@ -663,10 +667,13 @@ public final class MetalFilmRenderer {
                 &cvRecordTex
             )
             if let recMetalTex = cvRecordTex.flatMap({ CVMetalTextureGetTexture($0) }) {
+                var injectRecDetail: Int32 = (recordBakedFilm && params.wideAngleDistortion < 0.01 && params.stepPrintTrail < 0.01) ? 1 : 0
                 let recTGCount = MTLSize(width: (recW + 15) / 16, height: (recH + 15) / 16, depth: 1)
                 encoder.setComputePipelineState(pipePresentOrRecordBGRA8)
                 encoder.setTexture(recordBakedFilm ? texFilm : texLog, index: 0)
                 encoder.setTexture(recMetalTex, index: 1)
+                encoder.setTexture(lumaTex, index: 2)
+                encoder.setBytes(&injectRecDetail, length: MemoryLayout<Int32>.stride, index: 0)
                 encoder.dispatchThreadgroups(recTGCount, threadsPerThreadgroup: tgSize)
                 didEncodeRecording = true
             }
@@ -703,7 +710,7 @@ public final class MetalFilmRenderer {
             return nil
         }
 
-        var pack = buildMetalUniformsAndTables(params: params, imageWidth: fullW)
+        var pack = buildMetalUniformsAndTables(params: params, imageWidth: fullW, isRealtimeFastMode: false)
         let tableBytes = 81 * MemoryLayout<SIMD4<Float>>.stride
         let tgSize = MTLSize(width: 16, height: 16, depth: 1)
         let tgCount = MTLSize(width: (fullW + 15) / 16, height: (fullH + 15) / 16, depth: 1)

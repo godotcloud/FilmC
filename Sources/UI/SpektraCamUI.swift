@@ -32,7 +32,7 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
         mtkView.device = cameraService.metalRenderer?.device
         mtkView.framebufferOnly = false
         mtkView.colorPixelFormat = .bgra8Unorm
-        mtkView.preferredFramesPerSecond = 60
+        mtkView.preferredFramesPerSecond = 120
         mtkView.contentScaleFactor = 2.0
         mtkView.presentsWithTransaction = false
         mtkView.enableSetNeedsDisplay = false
