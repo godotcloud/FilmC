@@ -73,7 +73,7 @@ public enum TargetDisplayColorSpace: Int, CaseIterable, Identifiable, Codable, E
     case displayP3     = 1
     case rec2020HLG    = 2
 
-    public var id: String { rawValue }
+    public var id: Int { rawValue }
     public var displayName: String {
         switch self {
         case .sRGB:       return "sRGB"
@@ -88,7 +88,7 @@ public enum LogEncodingTransferFunction: Int, CaseIterable, Identifiable, Codabl
     case arriLogC3          = 1
     case kodakCineon10Bit   = 2
 
-    public var id: String { rawValue }
+    public var id: Int { rawValue }
     public var displayName: String {
         switch self {
         case .appleLogCompatible: return "Apple Log (Compatible)"
@@ -167,6 +167,12 @@ public struct HKCinemaRecipe: Identifiable, Equatable {
 
     public static func == (lhs: HKCinemaRecipe, rhs: HKCinemaRecipe) -> Bool {
         lhs.id == rhs.id
+    }
+}
+
+extension FilmSimulationParameters {
+    public mutating func applyHKCinemaRecipe(_ recipe: HKCinemaRecipe) {
+        self = recipe.buildParameters(self.lensFocalLengthMM)
     }
 }
 

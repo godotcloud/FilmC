@@ -112,96 +112,103 @@ private struct FilmStockCarouselStrip: View {
 
     var body: some View {
         VStack(spacing: 4) {
-            // 1. Hong Kong Cinema Master Recipes (Wong Kar-wai & Johnnie To Physical Darkroom Presets)
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    ForEach(HKCinemaRecipeDatabase.recipes) { recipe in
-                        let isSelected = (activeRecipeID == recipe.id)
-                        Button {
-                            onSelectRecipe(recipe)
-                        } label: {
-                            HStack(spacing: 4) {
-                                Text(recipe.title)
-                                    .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                    .foregroundColor(isSelected ? .black : .yellow)
-                                    .lineLimit(1)
-                                Text("· \(recipe.subtitle)")
-                                    .font(.system(size: 9, weight: .regular, design: .monospaced))
-                                    .foregroundColor(isSelected ? .black.opacity(0.85) : .gray)
-                                    .lineLimit(1)
-                            }
+            hkCinemaStrip
+            cameraStocksStrip
+            printStocksStrip
+        }
+    }
+
+    private var hkCinemaStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(HKCinemaRecipeDatabase.recipes) { recipe in
+                    let isSelected = (activeRecipeID == recipe.id)
+                    Button {
+                        onSelectRecipe(recipe)
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(recipe.title)
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .foregroundColor(isSelected ? .black : .yellow)
+                                .lineLimit(1)
+                            Text("· \(recipe.stockSummary)")
+                                .font(.system(size: 9, weight: .regular, design: .monospaced))
+                                .foregroundColor(isSelected ? .black.opacity(0.85) : .gray)
+                                .lineLimit(1)
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(isSelected ? Color.yellow : Color(white: 0.12))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(isSelected ? Color.yellow : Color.yellow.opacity(0.35), lineWidth: 1)
+                        )
+                        .cornerRadius(6)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var cameraStocksStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(FilmStockDatabase.cameraStocks) { stock in
+                    let isSelected = (selectedNegID == stock.id)
+                    Button {
+                        activeRecipeID = "standard_lab_neutral"
+                        selectedNegID = stock.id
+                    } label: {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(stock.name)
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .foregroundColor(isSelected ? .black : .white)
+                                .lineLimit(1)
+                            Text("\(Int(stock.isoSpeed)) ISO · \(Int(stock.referenceKelvin))K")
+                                .font(.system(size: 9, weight: .regular, design: .monospaced))
+                                .foregroundColor(isSelected ? .black.opacity(0.8) : .gray)
+                                .lineLimit(1)
+                        }
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 4)
+                        .background(isSelected ? Color.orange : Color(white: 0.14))
+                        .cornerRadius(8)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var printStocksStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(FilmStockDatabase.printStocks) { paper in
+                    let isSelected = (selectedPrintID == paper.id)
+                    Button {
+                        selectedPrintID = paper.id
+                    } label: {
+                        Text("Print: \(paper.name)")
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .foregroundColor(isSelected ? .orange : .gray)
+                            .lineLimit(1)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 4)
-                            .background(isSelected ? Color.yellow : Color(white: 0.12))
+                            .background(Color(white: 0.1))
                             .overlay(
                                 RoundedRectangle(cornerRadius: 6)
-                                    .stroke(isSelected ? Color.yellow : Color.yellow.opacity(0.35), lineWidth: 1)
+                                    .stroke(isSelected ? Color.orange : Color.clear, lineWidth: 1)
                             )
                             .cornerRadius(6)
-                        }
-                        .buttonStyle(.plain)
                     }
+                    .buttonStyle(.plain)
                 }
             }
-            .fixedSize(horizontal: false, vertical: true)
-
-            // 2. 30 Official & Lab-Calibrated Camera Film Stocks
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    ForEach(FilmStockDatabase.cameraStocks) { stock in
-                        let isSelected = (selectedNegID == stock.id)
-                        Button {
-                            activeRecipeID = "standard_neutral"
-                            selectedNegID = stock.id
-                        } label: {
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(stock.name)
-                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                    .foregroundColor(isSelected ? .black : .white)
-                                    .lineLimit(1)
-                                Text("\(Int(stock.isoSpeed)) ISO · \(Int(stock.referenceKelvin))K")
-                                    .font(.system(size: 9, weight: .regular, design: .monospaced))
-                                    .foregroundColor(isSelected ? .black.opacity(0.8) : .gray)
-                                    .lineLimit(1)
-                            }
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 4)
-                            .background(isSelected ? Color.orange : Color(white: 0.14))
-                            .cornerRadius(8)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-            .fixedSize(horizontal: false, vertical: true)
-
-            // 3. Darkroom Print Stocks (RA-4 / ECP-2E / Ilford Multigrade)
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    ForEach(FilmStockDatabase.printStocks) { paper in
-                        let isSelected = (selectedPrintID == paper.id)
-                        Button {
-                            selectedPrintID = paper.id
-                        } label: {
-                            Text("Print: \(paper.name)")
-                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                                .foregroundColor(isSelected ? .orange : .gray)
-                                .lineLimit(1)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(Color(white: 0.1))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 6)
-                                        .stroke(isSelected ? Color.orange : Color.clear, lineWidth: 1)
-                                )
-                                .cornerRadius(6)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-            .fixedSize(horizontal: false, vertical: true)
         }
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -220,7 +227,7 @@ public enum DarkroomInspectorTab: String, CaseIterable, Identifiable {
 public struct SpektraCamMainView: View {
     @StateObject private var cameraService = CameraCaptureService()
     @State private var params = FilmSimulationParameters()
-    @State private var activeRecipeID: String = "standard_neutral"
+    @State private var activeRecipeID: String = "standard_lab_neutral"
     @State private var isApplyingRecipe: Bool = false
     @State private var selectedTab: DarkroomInspectorTab = .exposure
     @State private var showDarkroomDrawer: Bool = true
@@ -353,7 +360,7 @@ public struct SpektraCamMainView: View {
                                     fresh.negativeStockID = currentNeg
                                     fresh.printStockID = currentPrt
                                     fresh.lensFocalLengthMM = cameraService.activeLens.nominalFocalMM
-                                    activeRecipeID = "standard_neutral"
+                                    activeRecipeID = "standard_lab_neutral"
                                     params = fresh
                                     cameraService.activeParameters = fresh
                                     cameraService.resetToContinuousAutoFocus()
@@ -390,7 +397,7 @@ public struct SpektraCamMainView: View {
                         updated.lensFocalLengthMM = cameraService.activeLens.nominalFocalMM
                         params = updated
                         cameraService.activeParameters = updated
-                        cameraService.statusBannerText = "HK Cinema: \(recipe.title) (\(recipe.subtitle))"
+                        cameraService.statusBannerText = "HK Cinema: \(recipe.title) (\(recipe.stockSummary))"
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                             isApplyingRecipe = false
                         }
