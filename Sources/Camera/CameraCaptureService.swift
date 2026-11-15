@@ -419,12 +419,14 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - True Hardware Video Format & Frame Rate Selection (Supports 24 / 30 / 60 fps)
+    // MARK: - True Hardware Video Format & Frame Rate Selection (Full ISP Quality + Focus Preservation)
     private func applyActiveFormatForModeAndFrameRate() {
         let isVideo = self.isCaptureModeVideo
         let resOption = self.videoResolution
         let fpsOption = self.videoFrameRate
         let orient = self.currentVideoOrientation
+        let manualFocus = self.isManualFocusMode
+        let manualPos = self.manualFocusLensPosition
 
         sessionQueue.async { [weak self] in
             guard let self = self,
@@ -438,90 +440,118 @@ public final class CameraCaptureService: NSObject, ObservableObject {
                     self.session.sessionPreset = .photo
                 }
                 self.photoOutput.isHighResolutionCaptureEnabled = true
-                if let pConn = self.photoOutput.connection(with: .video),
-                   pConn.isVideoOrientationSupported {
-                    pConn.videoOrientation = orient
+            } else {
+                self.photoOutput.isHighResolutionCaptureEnabled = false
+                let desiredFPS = Double(fpsOption.rawValue)
+
+                let targetPreset: AVCaptureSession.Preset
+                switch resOption {
+                case .uhd4k:   targetPreset = .hd4K3840x2160
+                case .fhd1080: targetPreset = .hd1920x1080
+                case .hd720p:  targetPreset = .hd1280x720
                 }
-                if let vConn = self.videoDataOutput.connection(with: .video),
-                   vConn.isVideoOrientationSupported {
+                if self.session.canSetSessionPreset(targetPreset) {
+                    self.session.sessionPreset = targetPreset
+                } else if self.session.canSetSessionPreset(.hd1920x1080) {
+                    self.session.sessionPreset = .hd1920x1080
+                }
+
+                let currentSupportsFPS = device.activeFormat.videoSupportedFrameRateRanges.contains {
+                    desiredFPS >= $0.minFrameRate && desiredFPS <= $0.maxFrameRate
+                }
+
+                if !currentSupportsFPS {
+                    let desiredW: Int32 = Int32(resOption.longEdge)
+                    let desiredH: Int32 = Int32(resOption.shortEdge)
+                    var bestFormat: AVCaptureDevice.Format? = nil
+                    var bestFoV: Float = -1.0
+
+                    for format in device.formats {
+                        guard !format.isVideoBinned else { continue }
+                        let desc = format.formatDescription
+                        let subType = CMFormatDescriptionGetMediaSubType(desc)
+                        guard subType == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
+                              subType == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange else {
+                            continue
+                        }
+                        let dims = CMVideoFormatDescriptionGetDimensions(desc)
+                        guard dims.width == desiredW && dims.height == desiredH else { continue }
+                        let supports60 = format.videoSupportedFrameRateRanges.contains {
+                            desiredFPS >= $0.minFrameRate && desiredFPS <= $0.maxFrameRate && $0.maxFrameRate <= 60.0
+                        }
+                        if supports60 && format.videoFieldOfView >= bestFoV {
+                            bestFoV = format.videoFieldOfView
+                            bestFormat = format
+                        }
+                    }
+
+                    if let chosen = bestFormat {
+                        do {
+                            try device.lockForConfiguration()
+                            device.activeFormat = chosen
+                            device.unlockForConfiguration()
+                        } catch {}
+                    }
+                }
+            }
+
+            if let pConn = self.photoOutput.connection(with: .video),
+               pConn.isVideoOrientationSupported {
+                pConn.videoOrientation = orient
+            }
+            if let vConn = self.videoDataOutput.connection(with: .video) {
+                if vConn.isVideoOrientationSupported {
                     vConn.videoOrientation = orient
                 }
-                self.session.commitConfiguration()
-                return
-            }
-
-            // In Video Mode: disable 12MP still high-res flag so 60fps video formats never conflict with photoOutput
-            self.photoOutput.isHighResolutionCaptureEnabled = false
-            let desiredFPS = Double(fpsOption.rawValue)
-            let desiredW: Int32 = Int32(resOption.longEdge)
-            let desiredH: Int32 = Int32(resOption.shortEdge)
-
-            var selectedFormat: AVCaptureDevice.Format? = nil
-            var selectedRange: AVFrameRateRange? = nil
-
-            for format in device.formats {
-                let desc = format.formatDescription
-                let subType = CMFormatDescriptionGetMediaSubType(desc)
-                guard subType == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
-                      subType == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange else {
-                    continue
-                }
-                let dims = CMVideoFormatDescriptionGetDimensions(desc)
-                guard dims.width == desiredW && dims.height == desiredH else { continue }
-                for range in format.videoSupportedFrameRateRanges {
-                    if desiredFPS >= range.minFrameRate && desiredFPS <= range.maxFrameRate {
-                        selectedFormat = format
-                        selectedRange = range
-                        break
-                    }
+                if vConn.isVideoStabilizationSupported {
+                    vConn.preferredVideoStabilizationMode = isVideo ? .standard : .off
                 }
             }
 
-            // Fallback to 1920x1080 @ desiredFPS if a lens doesn't expose a separate 1280x720 @ 60fps format
-            if selectedFormat == nil {
-                for format in device.formats {
-                    let desc = format.formatDescription
-                    let subType = CMFormatDescriptionGetMediaSubType(desc)
-                    guard subType == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
-                          subType == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange else {
-                        continue
-                    }
-                    let dims = CMVideoFormatDescriptionGetDimensions(desc)
-                    guard dims.width == 1920 && dims.height == 1080 else { continue }
-                    for range in format.videoSupportedFrameRateRanges {
+            self.session.commitConfiguration()
+
+            do {
+                try device.lockForConfiguration()
+                if isVideo {
+                    let desiredFPS = Double(fpsOption.rawValue)
+                    for range in device.activeFormat.videoSupportedFrameRateRanges {
                         if desiredFPS >= range.minFrameRate && desiredFPS <= range.maxFrameRate {
-                            selectedFormat = format
-                            selectedRange = range
+                            let duration = CMTimeMake(value: 1, timescale: Int32(desiredFPS.rounded()))
+                            device.activeVideoMinFrameDuration = duration
+                            device.activeVideoMaxFrameDuration = duration
                             break
                         }
                     }
+                } else {
+                    device.activeVideoMinFrameDuration = .invalid
+                    device.activeVideoMaxFrameDuration = .invalid
                 }
-            }
 
-            if let format = selectedFormat, let range = selectedRange {
-                do {
-                    try device.lockForConfiguration()
-                    device.activeFormat = format
-                    let clampedFPS = min(max(desiredFPS, range.minFrameRate), range.maxFrameRate)
-                    let duration = CMTimeMake(value: 1, timescale: Int32(max(1, Int(clampedFPS.rounded()))))
-                    device.activeVideoMinFrameDuration = duration
-                    device.activeVideoMaxFrameDuration = duration
+                if manualFocus && device.isLockingFocusWithCustomLensPositionSupported {
+                    device.setFocusModeLocked(lensPosition: manualPos, completionHandler: nil)
+                } else {
+                    if device.isFocusPointOfInterestSupported {
+                        device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
+                    }
+                    if device.isFocusModeSupported(.continuousAutoFocus) {
+                        device.focusMode = .continuousAutoFocus
+                    }
                     if device.isSmoothAutoFocusSupported {
                         device.isSmoothAutoFocusEnabled = true
                     }
-                    device.unlockForConfiguration()
-                } catch {}
-            } else {
-                if self.session.canSetSessionPreset(.hd1920x1080) {
-                    self.session.sessionPreset = .hd1920x1080
                 }
-            }
 
-            if let vConn = self.videoDataOutput.connection(with: .video),
-               vConn.isVideoOrientationSupported {
-                vConn.videoOrientation = orient
-            }
-            self.session.commitConfiguration()
+                if device.isExposurePointOfInterestSupported {
+                    device.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5)
+                }
+                if device.isExposureModeSupported(.continuousAutoExposure) {
+                    device.exposureMode = .continuousAutoExposure
+                }
+                if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                    device.whiteBalanceMode = .continuousAutoWhiteBalance
+                }
+                device.unlockForConfiguration()
+            } catch {}
         }
     }
 

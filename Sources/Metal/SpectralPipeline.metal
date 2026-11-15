@@ -465,7 +465,7 @@ kernel void kernel_fused_realtime_darkroom(
         float3 haloExcess = max(smoothBrightGlow - centerExp * 0.45f, float3(0.0f));
         float3 halationSignal = needHalation ? (haloExcess * u.halationStrengthRGB.rgb * 1.65f) : float3(0.0f);
         // Unclamped u.bloomStrength so all Optical Diffusion Filter models & Bloom Strength (0..1) respond strongly!
-        float3 bloomSignal = needBloom ? (smoothBrightGlow * u.bloomStrength * 0.95f) : float3(0.0f);
+        float3 bloomSignal = needBloom ? (smoothBrightGlow * u.bloomStrength * 0.52f) : float3(0.0f);
         centerExp = max(centerExp + halationSignal + bloomSignal, float3(1e-7f));
     }
 
@@ -627,7 +627,7 @@ kernel void kernel_fused_realtime_darkroom(
     // (In addition to pre-emulsion highlight expansion, optical diffusion filters scatter highlight photons
     // across neighbouring shadows/midtones on the image plane, producing a visible pearlescent mist glow!)
     if (needBloom) {
-        float3 mistVeil = smoothBrightGlow * (u.bloomStrength * 0.22f);
+        float3 mistVeil = smoothBrightGlow * (u.bloomStrength * 0.12f);
         linearOut = linearOut + mistVeil * clamp(1.15f - linearOut, float3(0.15f), float3(1.0f));
     }
 
@@ -1099,6 +1099,12 @@ kernel void kernel_present_or_record_bgra8(
 
     float2 clampedUV = clamp(normUV, float2(0.0f), float2(1.0f));
     constexpr sampler bilinearSampler(coord::normalized, address::clamp_to_edge, filter::linear);
-    float3 rgb = inSourceTexture.sample(bilinearSampler, clampedUV).rgb;
+    float2 dUV = float2(0.25f / float(max(dstW, 1u)), 0.25f / float(max(dstH, 1u)));
+    float3 rgb = 0.25f * (
+        inSourceTexture.sample(bilinearSampler, clamp(clampedUV + float2(-dUV.x, -dUV.y), float2(0.0f), float2(1.0f))).rgb +
+        inSourceTexture.sample(bilinearSampler, clamp(clampedUV + float2( dUV.x, -dUV.y), float2(0.0f), float2(1.0f))).rgb +
+        inSourceTexture.sample(bilinearSampler, clamp(clampedUV + float2(-dUV.x,  dUV.y), float2(0.0f), float2(1.0f))).rgb +
+        inSourceTexture.sample(bilinearSampler, clamp(clampedUV + float2( dUV.x,  dUV.y), float2(0.0f), float2(1.0f))).rgb
+    );
     outTargetTexture.write(float4(rgb, 1.0f), gid);
 }
