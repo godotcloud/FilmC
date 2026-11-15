@@ -3,8 +3,8 @@ name: Unpack SpektraCam ZIP to Repository
 on:
   push:
     paths:
-      - "SpektraCam-iOS-Full-Project.zip"
       - "*.zip"
+      - "**/*.zip"
   workflow_dispatch:
 
 permissions:
@@ -21,9 +21,9 @@ jobs:
 
       - name: Unpack ZIP into Target Folders
         run: |
-          ZIP_FILE=$(ls -1t *.zip 2>/dev/null | head -n 1)
+          ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" -type f | head -n 1)
           if [ -z "$ZIP_FILE" ]; then
-            echo "No .zip file found in repository root."
+            echo "No .zip file found in repository."
             exit 0
           fi
 
@@ -39,8 +39,8 @@ jobs:
             SRC_ROOT="/tmp/spektracam_extract"
           fi
 
-          # Detect whether this repository keeps Sources/ at root or inside SpektraCam/
-          if [ -f "project.yml" ] && [ ! -d "SpektraCam" ]; then
+          # Prefer repo root if project.yml or Sources/ already lives at root
+          if [ -f "project.yml" ] || [ -d "Sources" ]; then
             TARGET_DIR="."
           else
             TARGET_DIR="SpektraCam"
@@ -52,12 +52,18 @@ jobs:
           cp -Rf "$SRC_ROOT/Sources/"* "$TARGET_DIR/Sources/"
           cp -f "$SRC_ROOT/project.yml" "$TARGET_DIR/project.yml"
 
+          # Sync workflow files if present in archive
+          if [ -d "$SRC_ROOT/.github/workflows" ]; then
+            mkdir -p .github/workflows
+            cp -Rf "$SRC_ROOT/.github/workflows/"* .github/workflows/
+          fi
+
           # Remove legacy duplicate model files if present
           rm -f "$TARGET_DIR/Sources/Models/FilmStockParameters.swift"
           rm -f "$TARGET_DIR/Sources/Models/FilmStockDatabase.swift.bak"
 
-          # Clean up the uploaded zip so the repository stays tidy
-          rm -f "$ZIP_FILE"
+          # Clean up all uploaded zip archives so repo stays clean
+          find . -maxdepth 2 -name "*.zip" -type f -delete
           rm -rf /tmp/spektracam_extract
 
       - name: Commit and Push Extracted Files

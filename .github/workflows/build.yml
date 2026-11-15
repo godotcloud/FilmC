@@ -3,6 +3,13 @@ name: Build Unsigned SpektraCam iOS IPA
 on:
   push:
     branches: [ "main", "master" ]
+    paths-ignore:
+      - "*.zip"
+      - "**/*.zip"
+  workflow_run:
+    workflows: ["Unpack SpektraCam ZIP to Repository"]
+    types:
+      - completed
   workflow_dispatch:
 
 jobs:
@@ -13,6 +20,8 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_branch || github.ref_name }}
 
       - name: Select Xcode
         run: |
@@ -26,7 +35,7 @@ jobs:
 
       - name: Generate Xcode Project & Verify Metal Shaders
         run: |
-          if [ -f "SpektraCam/project.yml" ]; then
+          if [ -f "SpektraCam/project.yml" ] && [ ! -f "project.yml" ]; then
             cd SpektraCam
           fi
           rm -f Sources/Models/FilmStockParameters.swift
@@ -37,7 +46,7 @@ jobs:
 
       - name: Build Unsigned Release .app for arm64 (iOS Device)
         run: |
-          if [ -f "SpektraCam/SpektraCam.xcodeproj/project.pbxproj" ]; then
+          if [ -f "SpektraCam/SpektraCam.xcodeproj/project.pbxproj" ] && [ ! -f "SpektraCam.xcodeproj/project.pbxproj" ]; then
             cd SpektraCam
           fi
           xcodebuild clean build \
@@ -56,7 +65,7 @@ jobs:
 
       - name: Package Uncompressed Unsigned SpektraCam.ipa
         run: |
-          if [ -d "SpektraCam/build" ]; then
+          if [ -d "SpektraCam/build" ] && [ ! -d "build" ]; then
             cd SpektraCam
           fi
           mkdir -p build/Payload
