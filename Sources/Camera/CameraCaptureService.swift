@@ -87,19 +87,20 @@ public enum VideoResolutionPreset: String, CaseIterable, Identifiable, Equatable
 
     /// Optimal spectral carrier grid long edge (paired with Stage 5 native full-res 1080p/4K luma detail injection)
     /// Keeps Stage 0–4 GPU compute time under 1.8ms on A15 Bionic so 60fps never drops a single frame!
+    /// True 1:1 native pixel resolution for each selected video preset (zero downsampling!)
     public var metalWorkLongEdge: Int {
         switch self {
-        case .hd720p:  return 720
-        case .fhd1080: return 800
-        case .uhd4k:   return 880
+        case .hd720p:  return 1280
+        case .fhd1080: return 1920
+        case .uhd4k:   return 3840
         }
     }
 
     public var targetBitRate: Int {
         switch self {
-        case .hd720p:  return 16_000_000
-        case .fhd1080: return 32_000_000
-        case .uhd4k:   return 68_000_000
+        case .hd720p:  return 22_000_000
+        case .fhd1080: return 50_000_000
+        case .uhd4k:   return 115_000_000
         }
     }
 }

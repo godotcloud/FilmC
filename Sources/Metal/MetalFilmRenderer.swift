@@ -24,6 +24,7 @@ public final class MetalFilmRenderer {
 
     private let pipeYCbCr10ToLinearAndLog: MTLComputePipelineState
     private let pipeSpectralUpsampleExpose: MTLComputePipelineState
+    private let pipeHalationBloomHorizontal: MTLComputePipelineState
     private let pipeHalationAndScatter: MTLComputePipelineState
     private let pipeDevelopAndDIRCouplers: MTLComputePipelineState
     private let pipeEnlargerPrintAndGrain: MTLComputePipelineState
@@ -35,6 +36,7 @@ public final class MetalFilmRenderer {
     private var texStepPrintAccum: MTLTexture?
     private var texLogEncoded: MTLTexture?
     private var texEmulsionExposure: MTLTexture?
+    private var texHorizHalo: MTLTexture?
     private var texScatteredExposure: MTLTexture?
     private var texNegativeDensity: MTLTexture?
     private var texFilmRendered: MTLTexture?
@@ -43,6 +45,7 @@ public final class MetalFilmRenderer {
     private let photoRenderLock = NSLock()
     private var texPhotoPing: MTLTexture?
     private var texPhotoPong: MTLTexture?
+    private var texPhotoTemp: MTLTexture?
     private var currentPhotoSize: (width: Int, height: Int) = (0, 0)
 
     private let inFlightSemaphore = DispatchSemaphore(value: 3)
@@ -87,6 +90,7 @@ public final class MetalFilmRenderer {
         do {
             guard let fn0 = library.makeFunction(name: "kernel_ycbcr10_to_scene_linear_and_log"),
                   let fn1 = library.makeFunction(name: "kernel_spectral_upsample_and_expose"),
+                  let fn2h = library.makeFunction(name: "kernel_halation_bloom_horizontal"),
                   let fn2 = library.makeFunction(name: "kernel_halation_and_scatter"),
                   let fn3 = library.makeFunction(name: "kernel_develop_and_dir_couplers"),
                   let fn4 = library.makeFunction(name: "kernel_enlarger_print_and_grain"),
@@ -95,6 +99,7 @@ public final class MetalFilmRenderer {
             }
             self.pipeYCbCr10ToLinearAndLog = try dev.makeComputePipelineState(function: fn0)
             self.pipeSpectralUpsampleExpose = try dev.makeComputePipelineState(function: fn1)
+            self.pipeHalationBloomHorizontal = try dev.makeComputePipelineState(function: fn2h)
             self.pipeHalationAndScatter = try dev.makeComputePipelineState(function: fn2)
             self.pipeDevelopAndDIRCouplers = try dev.makeComputePipelineState(function: fn3)
             self.pipeEnlargerPrintAndGrain = try dev.makeComputePipelineState(function: fn4)
@@ -145,14 +150,15 @@ public final class MetalFilmRenderer {
         self.texStepPrintAccum = device.makeTexture(descriptor: desc)
         self.texLogEncoded = device.makeTexture(descriptor: desc)
         self.texEmulsionExposure = device.makeTexture(descriptor: desc)
+        self.texHorizHalo = device.makeTexture(descriptor: desc)
         self.texScatteredExposure = device.makeTexture(descriptor: desc)
         self.texNegativeDensity = device.makeTexture(descriptor: desc)
         self.texFilmRendered = device.makeTexture(descriptor: desc)
         self.currentAllocatedSize = (width, height)
     }
 
-    private func ensurePhotoPingPongTextures(width: Int, height: Int) -> (MTLTexture, MTLTexture)? {
-        if width != currentPhotoSize.width || height != currentPhotoSize.height || texPhotoPing == nil || texPhotoPong == nil {
+    private func ensurePhotoPingPongTextures(width: Int, height: Int) -> (MTLTexture, MTLTexture, MTLTexture)? {
+        if width != currentPhotoSize.width || height != currentPhotoSize.height || texPhotoPing == nil || texPhotoPong == nil || texPhotoTemp == nil {
             let desc = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: .rgba16Float,
                 width: width,
@@ -163,10 +169,11 @@ public final class MetalFilmRenderer {
             desc.storageMode = .private
             self.texPhotoPing = device.makeTexture(descriptor: desc)
             self.texPhotoPong = device.makeTexture(descriptor: desc)
+            self.texPhotoTemp = device.makeTexture(descriptor: desc)
             self.currentPhotoSize = (width, height)
         }
-        guard let ping = texPhotoPing, let pong = texPhotoPong else { return nil }
-        return (ping, pong)
+        guard let ping = texPhotoPing, let pong = texPhotoPong, let temp = texPhotoTemp else { return nil }
+        return (ping, pong, temp)
     }
 
     private static func blackbodyNormalized(lambdaNM: Float, kelvin: Float) -> Float {
@@ -562,6 +569,7 @@ public final class MetalFilmRenderer {
               let texStepAccum = texStepPrintAccum,
               let texLog = texLogEncoded,
               let texExp = texEmulsionExposure,
+              let texHHalo = texHorizHalo,
               let texScat = texScatteredExposure,
               let texNeg = texNegativeDensity,
               let texFilm = texFilmRendered else {
@@ -615,9 +623,16 @@ public final class MetalFilmRenderer {
         encoder.setBytes(&pack.sens, length: tableBytes, index: 1)
         encoder.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
 
+        encoder.setComputePipelineState(pipeHalationBloomHorizontal)
+        encoder.setTexture(texExp, index: 0)
+        encoder.setTexture(texHHalo, index: 1)
+        encoder.setBytes(&pack.uniforms, length: MemoryLayout<MetalFilmUniforms>.stride, index: 0)
+        encoder.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
+
         encoder.setComputePipelineState(pipeHalationAndScatter)
         encoder.setTexture(texExp, index: 0)
         encoder.setTexture(texScat, index: 1)
+        encoder.setTexture(texHHalo, index: 2)
         encoder.setBytes(&pack.uniforms, length: MemoryLayout<MetalFilmUniforms>.stride, index: 0)
         encoder.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
 
@@ -642,12 +657,9 @@ public final class MetalFilmRenderer {
         let dstH = outDrawableTex.height
         let dstTGCount = MTLSize(width: (dstW + 15) / 16, height: (dstH + 15) / 16, depth: 1)
 
-        var injectVFDetail: Int32 = (params.wideAngleDistortion > 0.01 || params.stepPrintTrail > 0.01) ? 0 : 1
         encoder.setComputePipelineState(pipePresentOrRecordBGRA8)
         encoder.setTexture(texFilm, index: 0)
         encoder.setTexture(outDrawableTex, index: 1)
-        encoder.setTexture(lumaTex, index: 2)
-        encoder.setBytes(&injectVFDetail, length: MemoryLayout<Int32>.stride, index: 0)
         encoder.dispatchThreadgroups(dstTGCount, threadsPerThreadgroup: tgSize)
 
         var cvRecordTex: CVMetalTexture?
@@ -667,13 +679,10 @@ public final class MetalFilmRenderer {
                 &cvRecordTex
             )
             if let recMetalTex = cvRecordTex.flatMap({ CVMetalTextureGetTexture($0) }) {
-                var injectRecDetail: Int32 = (recordBakedFilm && params.wideAngleDistortion < 0.01 && params.stepPrintTrail < 0.01) ? 1 : 0
                 let recTGCount = MTLSize(width: (recW + 15) / 16, height: (recH + 15) / 16, depth: 1)
                 encoder.setComputePipelineState(pipePresentOrRecordBGRA8)
                 encoder.setTexture(recordBakedFilm ? texFilm : texLog, index: 0)
                 encoder.setTexture(recMetalTex, index: 1)
-                encoder.setTexture(lumaTex, index: 2)
-                encoder.setBytes(&injectRecDetail, length: MemoryLayout<Int32>.stride, index: 0)
                 encoder.dispatchThreadgroups(recTGCount, threadsPerThreadgroup: tgSize)
                 didEncodeRecording = true
             }
@@ -706,7 +715,7 @@ public final class MetalFilmRenderer {
         let fullW = inputLinearTexture.width
         let fullH = inputLinearTexture.height
         guard fullW > 0 && fullH > 0,
-              let (texPing, texPong) = ensurePhotoPingPongTextures(width: fullW, height: fullH) else {
+              let (texPing, texPong, texTemp) = ensurePhotoPingPongTextures(width: fullW, height: fullH) else {
             return nil
         }
 
@@ -727,9 +736,16 @@ public final class MetalFilmRenderer {
         enc1.setBytes(&pack.sens, length: tableBytes, index: 1)
         enc1.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
 
+        enc1.setComputePipelineState(pipeHalationBloomHorizontal)
+        enc1.setTexture(texPing, index: 0)
+        enc1.setTexture(texTemp, index: 1)
+        enc1.setBytes(&pack.uniforms, length: MemoryLayout<MetalFilmUniforms>.stride, index: 0)
+        enc1.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
+
         enc1.setComputePipelineState(pipeHalationAndScatter)
         enc1.setTexture(texPing, index: 0)
         enc1.setTexture(texPong, index: 1)
+        enc1.setTexture(texTemp, index: 2)
         enc1.setBytes(&pack.uniforms, length: MemoryLayout<MetalFilmUniforms>.stride, index: 0)
         enc1.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
 

@@ -245,7 +245,7 @@ public enum HKCinemaRecipeDatabase {
                 p.chiaroscuroContrast = 0.25
                 p.printGammaContrast = 1.06
                 p.diffusionModel = .vintageSoftLens
-                p.bloomStrength = 0.24
+                p.bloomStrength = 0.16
                 p.bloomHighlightThreshold = 0.58
                 p.halationEnabled = true
                 p.halationStrengthRGB = SIMD3<Float>(0.12, 0.028, 0.003)
@@ -306,9 +306,9 @@ public enum HKCinemaRecipeDatabase {
                 p.highlightWarmthGold = 0.62
                 p.crossProcessAmount = 0.25
                 p.chiaroscuroContrast = 0.15
-                p.stepPrintTrail = 0.42
+                p.stepPrintTrail = 0.0
                 p.diffusionModel = .blackProMist1_4
-                p.bloomStrength = 0.26
+                p.bloomStrength = 0.16
                 p.bloomHighlightThreshold = 0.55
                 p.halationEnabled = true
                 p.halationStrengthRGB = SIMD3<Float>(0.11, 0.030, 0.004)
@@ -338,11 +338,11 @@ public enum HKCinemaRecipeDatabase {
                 p.highlightWarmthGold = 0.58
                 p.crossProcessAmount = 0.55
                 p.chiaroscuroContrast = 0.35
-                p.wideAngleDistortion = 0.68
-                p.stepPrintTrail = 0.48
+                p.wideAngleDistortion = 0.0
+                p.stepPrintTrail = 0.0
                 p.printGammaContrast = 1.08
                 p.diffusionModel = .blackProMist1_2
-                p.bloomStrength = 0.30
+                p.bloomStrength = 0.18
                 p.halationEnabled = true
                 p.halationStrengthRGB = SIMD3<Float>(0.15, 0.038, 0.005)
                 p.opticalVignettingStrength = 0.54
@@ -373,7 +373,7 @@ public enum HKCinemaRecipeDatabase {
                 p.chiaroscuroContrast = 0.25
                 p.bleachBypassAmount = 0.15
                 p.diffusionModel = .glimmerglass1_4
-                p.bloomStrength = 0.24
+                p.bloomStrength = 0.16
                 p.opticalVignettingStrength = 0.38
                 p.grainStrength = 1.28
                 return p
@@ -424,7 +424,7 @@ public enum HKCinemaRecipeDatabase {
                 p.chiaroscuroContrast = 0.20
                 p.bleachBypassAmount = 0.10
                 p.diffusionModel = .vintageSoftLens
-                p.bloomStrength = 0.26
+                p.bloomStrength = 0.16
                 p.opticalVignettingStrength = 0.38
                 p.grainStrength = 1.15
                 return p

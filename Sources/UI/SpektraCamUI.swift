@@ -80,7 +80,7 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
             let recTarget = cameraService.isRecordingVideo
                 ? cameraService.dequeueVideoRecordingBufferIfNeeded(cameraFrameID: snapshot.frameID)
                 : nil
-            let workEdge = (recTarget != nil) ? cameraService.videoResolution.metalWorkLongEdge : 840
+            let workEdge = cameraService.isCaptureModeVideo ? cameraService.videoResolution.metalWorkLongEdge : 1280
 
             let framePTS = snapshot.pts
             let serviceRef = self.cameraService
