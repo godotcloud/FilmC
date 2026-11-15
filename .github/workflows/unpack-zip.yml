@@ -52,11 +52,8 @@ jobs:
           cp -Rf "$SRC_ROOT/Sources/"* "$TARGET_DIR/Sources/"
           cp -f "$SRC_ROOT/project.yml" "$TARGET_DIR/project.yml"
 
-          # Sync workflow files if present in archive
-          if [ -d "$SRC_ROOT/.github/workflows" ]; then
-            mkdir -p .github/workflows
-            cp -Rf "$SRC_ROOT/.github/workflows/"* .github/workflows/
-          fi
+          # NOTE: Never copy or modify .github/workflows/* here because GITHUB_TOKEN
+          # lacks `workflows` permission and GitHub rejects the entire `git push`!
 
           # Remove legacy duplicate model files if present
           rm -f "$TARGET_DIR/Sources/Models/FilmStockParameters.swift"
