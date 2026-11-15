@@ -620,12 +620,13 @@ public final class MetalFilmRenderer {
         var is10BitFlag: Int32 = is10Bit ? 1 : 0
         let tgSize = MTLSize(width: 16, height: 16, depth: 1)
 
-        // Pass 1A & 1B: Continuous 11x11 Separable Gaussian Halation & Bloom on 1/4-Res Pyramid
+        // Pass 1A & 1B: Race-Free 1:1 Step-Print Update + Continuous 17x17 Separable Gaussian Halation & Bloom
         let haloTGCount = MTLSize(width: (haloW + 15) / 16, height: (haloH + 15) / 16, depth: 1)
         encoder.setComputePipelineState(pipeRTHaloExtractHoriz)
         encoder.setTexture(lumaTex, index: 0)
         encoder.setTexture(chromaTex, index: 1)
         encoder.setTexture(texHHoriz, index: 2)
+        encoder.setTexture(texStepAccum, index: 3)
         encoder.setBytes(&pack.uniforms, length: MemoryLayout<MetalFilmUniforms>.stride, index: 0)
         encoder.setBytes(&is10BitFlag, length: MemoryLayout<Int32>.stride, index: 1)
         encoder.dispatchThreadgroups(haloTGCount, threadsPerThreadgroup: tgSize)

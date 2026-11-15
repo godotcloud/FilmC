@@ -5,16 +5,19 @@
 //  Datasheet-Grade Physical Optics, Sensitometry & Photochemical Darkroom Compute Pipeline
 //  Optimized for Apple A15 Bionic (iPhone 13 Pro Max 5-Core GPU, Unified 6GB LPDDR4X)
 //
-//  ULTRA-FAST ZERO-INTERMEDIATE-DRAM FUSED 4K VIDEO ARCHITECTURE + 81-BAND 12MP STILL PIPELINE:
-//  1. Zero Full-4K Intermediate `rgba16Float` DRAM Traffic:
-//     - Previously, 7 separate 4K passes read/wrote 2,607 MB/frame of `rgba16Float` textures, capping A15 Bionic (34 GB/s) at 13 fps.
-//     - Now, Pass 1A & 1B compute the continuous 11x11 Separable Bilinear Gaussian Halation & Bloom on a 1/4-resolution
-//       pyramid buffer (`texHaloHoriz` & `texHaloBlur`), and Pass 2 (`kernel_fused_realtime_darkroom`) executes
-//       Scene-Linear -> 9-Subband Exact Spectral Integration -> Continuous Halo/Bloom Merge -> H-D Curve + 1px Eberhard Acutance
-//       + DIR Couplers + Chiaroscuro + Cross-Process -> Enlarger Print + Dual-Illuminant Split-Tone + Bleach Bypass + Native 4K Grain
-//       -> CIE 1931 XYZ Scanner -> Display P3/sRGB/HLG 100% IN GPU REGISTERS, writing directly to the 4K recording buffer (`48 MB/frame`,
-//       54x less DRAM traffic, <2.8ms per 4K frame for locked 4K 24fps / 30fps / 60fps!).
-//  2. Offline 12MP Still Photos (`3024x4032`): Full 81-band (5nm) spectral integration + separable continuous Gaussian halo.
+//  FIXES FOR STEP-PRINTING & OPTICAL BLOOM / HALATION:
+//  1. Race-Free 1:1 Step-Printing Accumulator:
+//     - Previously, updating `ioStepPrintAccum` (`haloW x haloH`) inside the full-4K kernel caused 16-64 threads
+//       to race on the same `accCoord` pixel and read uninitialized tile memory, producing a 16x16 plaid/grid artifact.
+//     - Now, `ioStepPrintAccum` is updated strictly 1:1 (one thread per pixel `gid`) inside `kernel_rt_halo_extract_horiz`
+//       (including clean initialization when `stepPrintTrail == 0`), and `kernel_fused_realtime_darkroom` samples it
+//       READ-ONLY via `texture2d<float, access::sample>` with hardware `filter::linear` bilinear interpolation!
+//  2. Responsive, Continuous 17x17 Separable Bilinear Gaussian Optical Bloom & Halation:
+//     - Removed the `min(u.bloomStrength, 0.35f)` clamp that blocked the Bloom Strength slider & Filter picker.
+//     - Wired `u.bloomRadiusPx`, `u.bloomThreshold`, and `u.bloomStrength` directly into both the 17-tap Horizontal
+//       and 17-tap Vertical bilinear Gaussian passes and added post-print optical mist veil so all 4 controls in
+//       Tab `② Bloom` (`Optical Diffusion Filter`, `Bloom / Mist Strength`, `Bloom Highlight Cutoff`, `Scatter Radius`)
+//       respond visibly and smoothly in real time!
 //
 
 #include <metal_stdlib>
@@ -229,12 +232,15 @@ inline float3 encode_custom_log(float3 linearRGB, int logMode) {
 }
 
 // ============================================================================
-// REAL-TIME PASS 1A (1/4 Resolution Pyramid): Extract Highlight Halo & Horizontal Blur
+// REAL-TIME PASS 1A (1/4 Resolution Pyramid):
+// 1. Race-Free 1:1 Step-Printing Temporal Accumulator Update (`ioStepPrintAccum`)
+// 2. Highlight Extraction & 17-Tap Horizontal Continuous Bilinear Gaussian Blur
 // ============================================================================
 kernel void kernel_rt_halo_extract_horiz(
     texture2d<float, access::sample> lumaPlane [[texture(0)]],
     texture2d<float, access::sample> chromaPlane [[texture(1)]],
     texture2d<float, access::write> outHaloHoriz [[texture(2)]],
+    texture2d<float, access::read_write> ioStepPrintAccum [[texture(3)]],
     constant MetalFilmUniforms &u [[buffer(0)]],
     constant int &is10BitInput [[buffer(1)]],
     uint2 gid [[thread_position_in_grid]]
@@ -243,6 +249,31 @@ kernel void kernel_rt_halo_extract_horiz(
     uint height = outHaloHoriz.get_height();
     if (gid.x >= width || gid.y >= height) return;
 
+    constexpr sampler linSampler(coord::normalized, address::clamp_to_edge, filter::linear);
+    float2 uvCenter = (float2(gid) + 0.5f) / float2(float(width), float(height));
+
+    // 1. Race-free 1:1 Step-Printing temporal update (every `gid` uniquely owns pixel `gid` of `ioStepPrintAccum`)
+    float yCenter = lumaPlane.sample(linSampler, uvCenter).r;
+    float2 cbcrCenter = chromaPlane.sample(linSampler, uvCenter).rg;
+    float3 centerLin = max(ycbcr_to_scene_linear(yCenter, cbcrCenter, is10BitInput), float3(1e-6f));
+
+    float stepPrintTrail = u.cinemaOpticsAndStep.y;
+    if (stepPrintTrail > 0.01f && u.frameSeed > 2u) {
+        float3 prevAccum = ioStepPrintAccum.read(gid).rgb;
+        // Guard against any NaN/Inf or uninitialized memory
+        if (isnan(prevAccum.r) || isnan(prevAccum.g) || isnan(prevAccum.b) || prevAccum.r < 0.0f || prevAccum.r > 20.0f) {
+            prevAccum = centerLin;
+        }
+        // Optical printer step-printing cadence: hold & blend previous exposure frames smoothly
+        float alpha = clamp(0.45f + stepPrintTrail * 0.45f, 0.0f, 0.90f);
+        float3 trailed = mix(centerLin, prevAccum, alpha);
+        trailed = mix(trailed, max(trailed, centerLin * 0.90f), 0.30f);
+        ioStepPrintAccum.write(float4(trailed, 1.0f), gid);
+    } else {
+        ioStepPrintAccum.write(float4(centerLin, 1.0f), gid);
+    }
+
+    // 2. Extract Highlight Halo/Bloom & Apply 17-Tap Horizontal Bilinear Gaussian
     bool needHalation = (dot(u.halationStrengthRGB.rgb, float3(1.0f)) > 1e-4f);
     bool needBloom = (u.bloomStrength > 1e-4f);
     if (!needHalation && !needBloom) {
@@ -250,18 +281,20 @@ kernel void kernel_rt_halo_extract_horiz(
         return;
     }
 
-    constexpr sampler linSampler(coord::normalized, address::clamp_to_edge, filter::linear);
-    float2 uvCenter = (float2(gid) + 0.5f) / float2(float(width), float(height));
     float invW = 1.0f / float(max(width, 1u));
-    float linearBloomCutoff = pow(clamp(u.bloomThreshold * 0.65f, 0.08f, 1.2f), 2.0f);
-    float stepUV = 1.35f * invW;
+    // Map `bloomThreshold` (0.15..1.20) directly to scene-linear cutoff so lowering the slider visibly blooms mid-highlights!
+    float cutoffLin = pow(clamp(u.bloomThreshold, 0.12f, 1.25f), 1.85f) * 0.42f;
+    // Scale pyramid blur radius dynamically with `u.bloomRadiusPx` & `u.halationRadiusPxRGB.x` (capped at 1.85px/tap for zero gaps!)
+    float activeRadPx = needBloom ? max(u.bloomRadiusPx, u.halationRadiusPxRGB.x * 0.5f) : u.halationRadiusPxRGB.x;
+    float pyrRadPx = clamp(activeRadPx * 0.18f, 1.6f, 14.8f);
+    float stepUV = (pyrRadPx / 8.0f) * invW;
 
     float3 accum = float3(0.0f);
     float wSum = 1e-5f;
 
-    for (int k = -5; k <= 5; ++k) {
-        float fk = float(k) * 0.20f;
-        float w = exp(-2.2f * fk * fk);
+    for (int k = -8; k <= 8; ++k) {
+        float fk = float(k) * (1.0f / 8.0f);
+        float w = exp(-2.0f * fk * fk);
         float2 sUV = clamp(uvCenter + float2(float(k) * stepUV, 0.0f), float2(0.0f), float2(1.0f));
 
         float yVal = lumaPlane.sample(linSampler, sUV).r;
@@ -273,8 +306,8 @@ kernel void kernel_rt_halo_extract_horiz(
         float3 s = baseLin * (1.0f + 3.40f * pow(hlKnee, 1.85f)) * u.exposureScale;
 
         float peak = max(max(s.r, s.g), s.b);
-        float hlGate = smoothstep(max(0.28f, linearBloomCutoff * 0.65f), max(0.95f, linearBloomCutoff * 1.65f), peak);
-        float3 brightExcess = max(s - float3(0.25f), float3(0.0f)) * hlGate;
+        float hlGate = smoothstep(cutoffLin * 0.45f, cutoffLin * 1.45f + 0.15f, peak);
+        float3 brightExcess = max(s - float3(cutoffLin * 0.40f), float3(0.0f)) * hlGate;
 
         accum += brightExcess * w;
         wSum += w;
@@ -284,7 +317,7 @@ kernel void kernel_rt_halo_extract_horiz(
 }
 
 // ============================================================================
-// REAL-TIME PASS 1B (1/4 Resolution Pyramid): Vertical Continuous Gaussian Blur
+// REAL-TIME PASS 1B (1/4 Resolution Pyramid): 17-Tap Vertical Continuous Gaussian Blur
 // ============================================================================
 kernel void kernel_rt_halo_blur_vert(
     texture2d<float, access::sample> inHaloHoriz [[texture(0)]],
@@ -306,14 +339,17 @@ kernel void kernel_rt_halo_blur_vert(
     constexpr sampler linSampler(coord::normalized, address::clamp_to_edge, filter::linear);
     float2 uvCenter = (float2(gid) + 0.5f) / float2(float(width), float(height));
     float invH = 1.0f / float(max(height, 1u));
-    float stepUV = 1.35f * invH;
+
+    float activeRadPx = needBloom ? max(u.bloomRadiusPx, u.halationRadiusPxRGB.x * 0.5f) : u.halationRadiusPxRGB.x;
+    float pyrRadPx = clamp(activeRadPx * 0.18f, 1.6f, 14.8f);
+    float stepUV = (pyrRadPx / 8.0f) * invH;
 
     float3 accum = float3(0.0f);
     float wSum = 1e-5f;
 
-    for (int k = -5; k <= 5; ++k) {
-        float fk = float(k) * 0.20f;
-        float w = exp(-2.2f * fk * fk);
+    for (int k = -8; k <= 8; ++k) {
+        float fk = float(k) * (1.0f / 8.0f);
+        float w = exp(-2.0f * fk * fk);
         float2 sUV = clamp(uvCenter + float2(0.0f, float(k) * stepUV), float2(0.0f), float2(1.0f));
         accum += inHaloHoriz.sample(linSampler, sUV).rgb * w;
         wSum += w;
@@ -324,13 +360,13 @@ kernel void kernel_rt_halo_blur_vert(
 
 // ============================================================================
 // REAL-TIME PASS 2 (100% Native 4K / 1080p / 720p Fused Register Darkroom):
-// Zero Intermediate Full-4K `rgba16Float` DRAM Traffic (<2.8ms at 3840x2160!)
+// Reads `inStepPrintAccum` READ-ONLY via hardware bilinear sampler (Zero Race Conditions!)
 // ============================================================================
 kernel void kernel_fused_realtime_darkroom(
     texture2d<float, access::sample> lumaPlane [[texture(0)]],
     texture2d<float, access::sample> chromaPlane [[texture(1)]],
     texture2d<float, access::sample> inHaloBlur [[texture(2)]],
-    texture2d<float, access::read_write> ioStepPrintAccum [[texture(3)]],
+    texture2d<float, access::sample> inStepPrintAccum [[texture(3)]],
     texture2d<float, access::write> outTargetBGRA8 [[texture(4)]],
     constant MetalFilmUniforms &u [[buffer(0)]],
     constant float4 *spectralSensitivityTable [[buffer(1)]],
@@ -366,7 +402,6 @@ kernel void kernel_fused_realtime_darkroom(
 
     constexpr sampler bilinearSampler(coord::normalized, address::clamp_to_edge, filter::linear);
 
-    float3 baseLin;
     float wideDistort = u.cinemaOpticsAndStep.x;
     float2 sampleCenterUV = clamp(normUV, float2(0.0f), float2(1.0f));
 
@@ -379,22 +414,14 @@ kernel void kernel_fused_realtime_darkroom(
 
     float yCenter = lumaPlane.sample(bilinearSampler, sampleCenterUV).r;
     float2 cbcrCenter = chromaPlane.sample(bilinearSampler, sampleCenterUV).rg;
-    baseLin = max(ycbcr_to_scene_linear(yCenter, cbcrCenter, is10BitInput), float3(1e-6f));
+    float3 baseLin = max(ycbcr_to_scene_linear(yCenter, cbcrCenter, is10BitInput), float3(1e-6f));
 
-    // Optional Christopher Doyle Step-Printing Trail (mapped onto compact accumulator texture)
+    // Read-Only Bilinear Step-Printing Trail Merge (100% smooth, zero threadgroup race conditions!)
     float stepPrintTrail = u.cinemaOpticsAndStep.y;
     if (stepPrintTrail > 0.01f) {
-        uint accW = ioStepPrintAccum.get_width();
-        uint accH = ioStepPrintAccum.get_height();
-        uint2 accCoord = uint2(
-            clamp(uint(sampleCenterUV.x * float(accW)), 0u, max(accW, 1u) - 1u),
-            clamp(uint(sampleCenterUV.y * float(accH)), 0u, max(accH, 1u) - 1u)
-        );
-        float3 prevAccum = ioStepPrintAccum.read(accCoord).rgb;
-        float alpha = clamp(stepPrintTrail * 0.78f, 0.0f, 0.84f);
-        float3 blended = mix(baseLin, prevAccum, alpha);
-        baseLin = mix(blended, max(blended, baseLin * 0.88f), 0.35f);
-        ioStepPrintAccum.write(float4(baseLin, 1.0f), accCoord);
+        float3 trailLin = inStepPrintAccum.sample(bilinearSampler, sampleCenterUV).rgb;
+        float blendWeight = clamp(stepPrintTrail * 0.85f, 0.0f, 0.88f);
+        baseLin = mix(baseLin, trailLin, blendWeight);
     }
 
     // 1-Pixel Native-Resolution Eberhard Edge Acutance directly from sensor Luma plane
@@ -405,7 +432,7 @@ kernel void kernel_fused_realtime_darkroom(
         lumaPlane.sample(bilinearSampler, clamp(sampleCenterUV + float2( onePxUV.x, 0.0f), float2(0.0f), float2(1.0f))).r +
         lumaPlane.sample(bilinearSampler, clamp(sampleCenterUV + float2(-onePxUV.x, 0.0f), float2(0.0f), float2(1.0f))).r
     );
-    float eberhardEdgeDelta = clamp(yCenter - ySurround, -0.20f, 0.20f);
+    float eberhardEdgeDelta = clamp(yCenter - ySurround, -0.20f, 0.20f) * (1.0f - stepPrintTrail * 0.7f);
 
     // Stage 1: Inverse-ISP Highlight Decompression & 9-Subband Exact Spectral Emulsion Integration
     float peakLin = max(max(baseLin.r, baseLin.g), baseLin.b);
@@ -429,14 +456,16 @@ kernel void kernel_fused_realtime_darkroom(
     }
     centerExp = max(centerExp * (albedoScale * 9.0f), float3(1e-7f));
 
-    // Stage 2: Merge Continuous 2D Gaussian Halation & Bloom from 1/4-Res Pyramid
+    // Stage 2: Merge Continuous 17x17 2D Gaussian Halation & Optical Bloom from 1/4-Res Pyramid
     bool needHalation = (dot(u.halationStrengthRGB.rgb, float3(1.0f)) > 1e-4f);
     bool needBloom = (u.bloomStrength > 1e-4f);
+    float3 smoothBrightGlow = float3(0.0f);
     if (needHalation || needBloom) {
-        float3 smoothBrightGlow = inHaloBlur.sample(bilinearSampler, sampleCenterUV).rgb;
-        float3 haloExcess = max(smoothBrightGlow - centerExp * 0.55f, float3(0.0f));
-        float3 halationSignal = needHalation ? (haloExcess * u.halationStrengthRGB.rgb * 1.35f) : float3(0.0f);
-        float3 bloomSignal = needBloom ? (smoothBrightGlow * min(u.bloomStrength, 0.35f) * 0.55f) : float3(0.0f);
+        smoothBrightGlow = inHaloBlur.sample(bilinearSampler, sampleCenterUV).rgb;
+        float3 haloExcess = max(smoothBrightGlow - centerExp * 0.45f, float3(0.0f));
+        float3 halationSignal = needHalation ? (haloExcess * u.halationStrengthRGB.rgb * 1.65f) : float3(0.0f);
+        // Unclamped u.bloomStrength so all Optical Diffusion Filter models & Bloom Strength (0..1) respond strongly!
+        float3 bloomSignal = needBloom ? (smoothBrightGlow * u.bloomStrength * 0.95f) : float3(0.0f);
         centerExp = max(centerExp + halationSignal + bloomSignal, float3(1e-7f));
     }
 
@@ -594,6 +623,14 @@ kernel void kernel_fused_realtime_darkroom(
     linearOut = (linearOut - float3(u.blackPoint)) / max(1.0f - u.blackPoint + u.whitePoint, 0.1f);
     linearOut = max(linearOut, float3(0.0f));
 
+    // Optical Pro-Mist / Glimmerglass Atmospheric Veil in Linear Positive Space
+    // (In addition to pre-emulsion highlight expansion, optical diffusion filters scatter highlight photons
+    // across neighbouring shadows/midtones on the image plane, producing a visible pearlescent mist glow!)
+    if (needBloom) {
+        float3 mistVeil = smoothBrightGlow * (u.bloomStrength * 0.22f);
+        linearOut = linearOut + mistVeil * clamp(1.15f - linearOut, float3(0.15f), float3(1.0f));
+    }
+
     if (u.isReversalOrMono == 2) {
         float monoLuma = dot(linearOut, float3(0.2126f, 0.7152f, 0.0722f));
         linearOut = float3(monoLuma);
@@ -730,22 +767,23 @@ kernel void kernel_halation_bloom_horizontal(
     float2 uvCenter = (float2(gid) + 0.5f) / float2(float(width), float(height));
     float invW = 1.0f / float(max(width, 1u));
 
-    float linearBloomCutoff = pow(clamp(u.bloomThreshold * 0.65f, 0.08f, 1.2f), 2.0f);
-    float effRadiusPx = clamp(max(u.halationRadiusPxRGB.x, u.bloomRadiusPx) * 0.45f, 2.0f, 14.0f);
-    float stepUV = (effRadiusPx / 5.0f) * invW;
+    float cutoffLin = pow(clamp(u.bloomThreshold, 0.12f, 1.25f), 1.85f) * 0.42f;
+    float activeRadPx = needBloom ? max(u.bloomRadiusPx, u.halationRadiusPxRGB.x * 0.5f) : u.halationRadiusPxRGB.x;
+    float effRadiusPx = clamp(activeRadPx * 0.55f, 2.0f, 15.0f);
+    float stepUV = (effRadiusPx / 8.0f) * invW;
 
     float3 accum = float3(0.0f);
     float wSum = 1e-5f;
 
-    for (int k = -5; k <= 5; ++k) {
-        float fk = float(k) * 0.20f;
-        float w = exp(-2.2f * fk * fk);
+    for (int k = -8; k <= 8; ++k) {
+        float fk = float(k) * (1.0f / 8.0f);
+        float w = exp(-2.0f * fk * fk);
         float2 sampleUV = clamp(uvCenter + float2(float(k) * stepUV, 0.0f), float2(0.0f), float2(1.0f));
         float3 s = inExposure.sample(linSampler, sampleUV).rgb;
 
         float peak = max(max(s.r, s.g), s.b);
-        float hlGate = smoothstep(max(0.28f, linearBloomCutoff * 0.65f), max(0.95f, linearBloomCutoff * 1.65f), peak);
-        float3 brightExcess = max(s - float3(0.25f), float3(0.0f)) * hlGate;
+        float hlGate = smoothstep(cutoffLin * 0.45f, cutoffLin * 1.45f + 0.15f, peak);
+        float3 brightExcess = max(s - float3(cutoffLin * 0.40f), float3(0.0f)) * hlGate;
 
         accum += brightExcess * w;
         wSum += w;
@@ -778,24 +816,25 @@ kernel void kernel_halation_and_scatter(
     float2 uvCenter = (float2(gid) + 0.5f) / float2(float(width), float(height));
     float invH = 1.0f / float(max(height, 1u));
 
-    float effRadiusPx = clamp(max(u.halationRadiusPxRGB.x, u.bloomRadiusPx) * 0.45f, 2.0f, 14.0f);
-    float stepUV = (effRadiusPx / 5.0f) * invH;
+    float activeRadPx = needBloom ? max(u.bloomRadiusPx, u.halationRadiusPxRGB.x * 0.5f) : u.halationRadiusPxRGB.x;
+    float effRadiusPx = clamp(activeRadPx * 0.55f, 2.0f, 15.0f);
+    float stepUV = (effRadiusPx / 8.0f) * invH;
 
     float3 blurAccum = float3(0.0f);
     float wSum = 1e-5f;
 
-    for (int k = -5; k <= 5; ++k) {
-        float fk = float(k) * 0.20f;
-        float w = exp(-2.2f * fk * fk);
+    for (int k = -8; k <= 8; ++k) {
+        float fk = float(k) * (1.0f / 8.0f);
+        float w = exp(-2.0f * fk * fk);
         float2 sampleUV = clamp(uvCenter + float2(0.0f, float(k) * stepUV), float2(0.0f), float2(1.0f));
         blurAccum += inHorizHalo.sample(linSampler, sampleUV).rgb * w;
         wSum += w;
     }
 
     float3 smoothBrightGlow = blurAccum / wSum;
-    float3 haloExcess = max(smoothBrightGlow - centerExp * 0.55f, float3(0.0f));
-    float3 halationSignal = needHalation ? (haloExcess * u.halationStrengthRGB.rgb * 1.35f) : float3(0.0f);
-    float3 bloomSignal = needBloom ? (smoothBrightGlow * min(u.bloomStrength, 0.35f) * 0.55f) : float3(0.0f);
+    float3 haloExcess = max(smoothBrightGlow - centerExp * 0.45f, float3(0.0f));
+    float3 halationSignal = needHalation ? (haloExcess * u.halationStrengthRGB.rgb * 1.65f) : float3(0.0f);
+    float3 bloomSignal = needBloom ? (smoothBrightGlow * u.bloomStrength * 1.15f) : float3(0.0f);
 
     float3 finalExposure = max(centerExp + halationSignal + bloomSignal, float3(1e-7f));
     outScatteredExposure.write(float4(finalExposure, 1.0f), gid);
