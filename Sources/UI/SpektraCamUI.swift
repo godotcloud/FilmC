@@ -156,30 +156,38 @@ private struct FilmStockCarouselStrip: View {
     }
 
     private var cameraStocksStrip: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                ForEach(FilmStockDatabase.cameraStocks) { stock in
-                    let isSelected = (selectedNegID == stock.id)
-                    Button {
-                        activeRecipeID = "standard_lab_neutral"
-                        selectedNegID = stock.id
-                    } label: {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(stock.name)
-                                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                .foregroundColor(isSelected ? .black : .white)
-                                .lineLimit(1)
-                            Text("\(Int(stock.isoSpeed)) ISO · \(Int(stock.referenceKelvin))K")
-                                .font(.system(size: 9, weight: .regular, design: .monospaced))
-                                .foregroundColor(isSelected ? .black.opacity(0.8) : .gray)
-                                .lineLimit(1)
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(FilmStockDatabase.cameraStocks) { stock in
+                        let isSelected = (selectedNegID == stock.id)
+                        Button {
+                            activeRecipeID = "standard_lab_neutral"
+                            selectedNegID = stock.id
+                        } label: {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(stock.name)
+                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                    .foregroundColor(isSelected ? .black : .white)
+                                    .lineLimit(1)
+                                Text("\(Int(stock.isoSpeed)) ISO · \(Int(stock.referenceKelvin))K")
+                                    .font(.system(size: 9, weight: .regular, design: .monospaced))
+                                    .foregroundColor(isSelected ? .black.opacity(0.8) : .gray)
+                                    .lineLimit(1)
+                            }
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
+                            .background(isSelected ? Color.orange : Color(white: 0.14))
+                            .cornerRadius(8)
                         }
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 4)
-                        .background(isSelected ? Color.orange : Color(white: 0.14))
-                        .cornerRadius(8)
+                        .buttonStyle(.plain)
+                        .id(stock.id)
                     }
-                    .buttonStyle(.plain)
+                }
+            }
+            .onChange(of: selectedNegID) { newID in
+                withAnimation(.easeInOut(duration: 0.22)) {
+                    proxy.scrollTo(newID, anchor: .center)
                 }
             }
         }
@@ -187,27 +195,35 @@ private struct FilmStockCarouselStrip: View {
     }
 
     private var printStocksStrip: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                ForEach(FilmStockDatabase.printStocks) { paper in
-                    let isSelected = (selectedPrintID == paper.id)
-                    Button {
-                        selectedPrintID = paper.id
-                    } label: {
-                        Text("Print: \(paper.name)")
-                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                            .foregroundColor(isSelected ? .orange : .gray)
-                            .lineLimit(1)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Color(white: 0.1))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 6)
-                                    .stroke(isSelected ? Color.orange : Color.clear, lineWidth: 1)
-                            )
-                            .cornerRadius(6)
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(FilmStockDatabase.printStocks) { paper in
+                        let isSelected = (selectedPrintID == paper.id)
+                        Button {
+                            selectedPrintID = paper.id
+                        } label: {
+                            Text("Print: \(paper.name)")
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .foregroundColor(isSelected ? .orange : .gray)
+                                .lineLimit(1)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color(white: 0.1))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .stroke(isSelected ? Color.orange : Color.clear, lineWidth: 1)
+                                )
+                                .cornerRadius(6)
+                        }
+                        .buttonStyle(.plain)
+                        .id(paper.id)
                     }
-                    .buttonStyle(.plain)
+                }
+            }
+            .onChange(of: selectedPrintID) { newID in
+                withAnimation(.easeInOut(duration: 0.22)) {
+                    proxy.scrollTo(newID, anchor: .center)
                 }
             }
         }
@@ -534,7 +550,7 @@ public struct SpektraCamMainView: View {
                     .minimumScaleFactor(0.75)
             }
             Spacer()
-            Text(params.filmFormatGate.displayName.components(separatedBy: " ").first ?? "35mm")
+            Text(params.filmFormatGate.shortBadge)
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .lineLimit(1)
                 .padding(.horizontal, 8)
@@ -624,15 +640,17 @@ public struct SpektraCamMainView: View {
                             .buttonStyle(.plain)
                         }
 
-                        paramSlider(
-                            title: "Manual Focus Position (Macro ↔ ∞)",
-                            value: Binding(
-                                get: { cameraService.manualFocusLensPosition },
-                                set: { newVal in cameraService.setManualFocusLensPosition(newVal) }
-                            ),
-                            range: 0.0...1.0,
-                            unit: ""
-                        )
+                        if cameraService.isManualFocusMode {
+                            paramSlider(
+                                title: "Manual Focus Position (Macro ↔ ∞)",
+                                value: Binding(
+                                    get: { cameraService.manualFocusLensPosition },
+                                    set: { newVal in cameraService.setManualFocusLensPosition(newVal) }
+                                ),
+                                range: 0.0...1.0,
+                                unit: ""
+                            )
+                        }
                         paramSlider(title: "Negative Exposure EV", value: $params.exposureCompensationEV, range: -4.0...4.0, unit: "EV")
                         Toggle("Auto Print EV Compensation", isOn: $params.autoPrintExposureComp)
                             .font(.system(size: 11, design: .monospaced))

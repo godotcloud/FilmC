@@ -306,14 +306,12 @@ public final class MetalFilmRenderer {
                 let refIllum = Self.blackbodyNormalized(lambdaNM: lambda, kelvin: negStock.referenceKelvin)
                 refIllumIntegral += negSens[i] * refIllum
             }
-            let tungstenMix: Float = (negStock.referenceKelvin < 4000.0) ? 0.16 : 0.0
             for i in 0..<81 {
                 let lambda = Float(380 + i * 5)
                 let refIllum = Self.blackbodyNormalized(lambdaNM: lambda, kelvin: negStock.referenceKelvin)
-                let userKelvinShift = Self.blackbodyNormalized(lambdaNM: lambda, kelvin: sceneKelvin)
-                                    / max(Self.blackbodyNormalized(lambdaNM: lambda, kelvin: 5500.0), 1e-5)
-                let dayIllum = Self.blackbodyNormalized(lambdaNM: lambda, kelvin: 5500.0)
-                let effIllum = ((1.0 - tungstenMix) * refIllum + tungstenMix * dayIllum) * (0.65 + 0.35 * userKelvinShift)
+                let userKelvinRatio = Self.blackbodyNormalized(lambdaNM: lambda, kelvin: 5500.0)
+                                    / max(Self.blackbodyNormalized(lambdaNM: lambda, kelvin: sceneKelvin), 1e-5)
+                let effIllum = refIllum * (0.65 + 0.35 * userKelvinRatio)
                 let normSens = (negSens[i] * effIllum) / refIllumIntegral
                 cachedSensTable[i] = SIMD4<Float>(normSens.x, normSens.y, normSens.z, 1.0)
             }
@@ -348,7 +346,12 @@ public final class MetalFilmRenderer {
         }
 
         if stockChanged || filterChanged {
-            let scaledFilter = filterCMY * 0.0045
+            // Hazeltine density-compensated Printer Lights polarity:
+            // +Yellow CC (+filterCMY.z) -> warmer golden print; +Magenta CC (+filterCMY.y) -> richer crimson/magenta print;
+            // -Magenta CC -> emerald green print; +Cyan CC (+filterCMY.x) -> cooler cyan/teal print.
+            let meanTrim = (filterCMY.x * 0.26 + filterCMY.y * 0.46 + filterCMY.z * 0.28) * 0.72
+            let balancedCMY = filterCMY - SIMD3<Float>(repeating: meanTrim)
+            let scaledFilter = -balancedCMY * 0.0062
             for i in 0..<81 {
                 let filterDensity = simd_dot(scaledFilter, dichroicLobes81[i])
                 let filterTrans = powf(10.0, -min(max(filterDensity, -2.0), 4.5))
@@ -471,7 +474,17 @@ public final class MetalFilmRenderer {
             blackPoint: params.blackPointOffset,
             whitePoint: params.whitePointOffset,
             printPipelineMode: Int32(params.printPipelineMode.rawValue),
-            negativeGammaRGB: SIMD4<Float>(negStock.gammaRGB.x, negStock.gammaRGB.y, negStock.gammaRGB.z, 0),
+            negativeGammaRGB: {
+                if modeFlag == 0 {
+                    let gMean = (negStock.gammaRGB.x + negStock.gammaRGB.y + negStock.gammaRGB.z) / 3.0
+                    let gR = max(negStock.gammaRGB.x, gMean + 0.012)
+                    let gG = negStock.gammaRGB.y
+                    let gB = min(negStock.gammaRGB.z, gMean - 0.012)
+                    return SIMD4<Float>(gR, gG, gB, 0)
+                } else {
+                    return SIMD4<Float>(negStock.gammaRGB.x, negStock.gammaRGB.y, negStock.gammaRGB.z, 0)
+                }
+            }(),
             negativeDminRGB: SIMD4<Float>(negStock.dMinRGB.x, negStock.dMinRGB.y, negStock.dMinRGB.z, 0),
             negativeDmaxRGB: SIMD4<Float>(negStock.dMaxRGB.x, negStock.dMaxRGB.y, negStock.dMaxRGB.z, 0),
             negativeShoulderRGB: SIMD4<Float>(negStock.shoulderSoftnessRGB.x, negStock.shoulderSoftnessRGB.y, negStock.shoulderSoftnessRGB.z, 0),

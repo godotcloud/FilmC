@@ -19,6 +19,16 @@ public enum FilmFormatGate: String, CaseIterable, Identifiable, Codable, Equatab
     public var id: String { rawValue }
     public var displayName: String { rawValue }
 
+    public var shortBadge: String {
+        switch self {
+        case .fullFrame35mm:   return "35mm"
+        case .halfFrame35mm:   return "Half"
+        case .mediumFormat645: return "645"
+        case .mediumFormat67:  return "6×7"
+        case .super35Motion:   return "S35"
+        }
+    }
+
     public var gateWidthMM: Float {
         switch self {
         case .fullFrame35mm:   return 36.0
@@ -193,26 +203,27 @@ public enum HKCinemaRecipeDatabase {
             id: "wkw_in_the_mood_for_love",
             title: "王家卫《花样年华》",
             directorAndYear: "In the Mood for Love (2000 · 杜可风)",
-            stockSummary: "5279 500T (+1 Push) → 2393 Print",
+            stockSummary: "5279 500T (+0.85 Push) → 2393",
             buildParameters: { focalMM in
                 var p = FilmSimulationParameters()
                 p.lensFocalLengthMM = focalMM
                 p.negativeStockID = "kodak_vision_500t_5279"
                 p.printStockID = "kodak_premier_2393"
                 p.filmFormatGate = .super35Motion
-                p.pushPullStops = 1.0
-                p.dirCouplerAmount = 1.35
+                p.pushPullStops = 0.85
+                p.dirCouplerAmount = 1.45
+                // Lush cheongsam crimson-red & warm tungsten amber-gold (+Y, +M, -C)
                 p.dichroicYellowCC = 18.0
-                p.dichroicMagentaCC = 10.0
-                p.dichroicCyanCC = -6.0
-                p.printGammaContrast = 1.08
+                p.dichroicMagentaCC = 9.0
+                p.dichroicCyanCC = -12.0
+                p.printGammaContrast = 1.06
                 p.diffusionModel = .vintageSoftLens
-                p.bloomStrength = 0.24
-                p.bloomHighlightThreshold = 0.58
+                p.bloomStrength = 0.22
+                p.bloomHighlightThreshold = 0.60
                 p.halationEnabled = true
                 p.halationStrengthRGB = SIMD3<Float>(0.11, 0.025, 0.003)
-                p.opticalVignettingStrength = 0.42
-                p.grainStrength = 1.15
+                p.opticalVignettingStrength = 0.38
+                p.grainStrength = 1.10
                 return p
             }
         ),
@@ -220,27 +231,26 @@ public enum HKCinemaRecipeDatabase {
             id: "wkw_chungking_express",
             title: "王家卫《重庆森林》",
             directorAndYear: "Chungking Express (1994 · 杜可风/刘伟强)",
-            stockSummary: "EXR 5298 500T (+1.5 Push) → 2383",
+            stockSummary: "EXR 5298 500T (+1.0 Push) → 2383",
             buildParameters: { focalMM in
                 var p = FilmSimulationParameters()
                 p.lensFocalLengthMM = focalMM
                 p.negativeStockID = "eastman_exr_500t_5298"
                 p.printStockID = "kodak_vision_2383"
                 p.filmFormatGate = .super35Motion
-                p.sceneIlluminantKelvin = 4400.0
-                p.pushPullStops = 1.35
-                p.dirCouplerAmount = 1.30
-                // Fluorescent mercury-vapor emerald/cyan-yellow timing
-                p.dichroicYellowCC = 8.0
+                p.pushPullStops = 1.00
+                p.dirCouplerAmount = 1.35
+                // Fluorescent mercury-vapor emerald-cyan shadows + warm golden highlights
+                p.dichroicYellowCC = 10.0
                 p.dichroicMagentaCC = -18.0
-                p.dichroicCyanCC = 12.0
+                p.dichroicCyanCC = 10.0
                 p.diffusionModel = .blackProMist1_4
-                p.bloomStrength = 0.28
-                p.bloomHighlightThreshold = 0.55
+                p.bloomStrength = 0.25
+                p.bloomHighlightThreshold = 0.56
                 p.halationEnabled = true
                 p.halationStrengthRGB = SIMD3<Float>(0.10, 0.028, 0.004)
-                p.opticalVignettingStrength = 0.38
-                p.grainStrength = 1.30
+                p.opticalVignettingStrength = 0.35
+                p.grainStrength = 1.25
                 return p
             }
         ),
@@ -248,50 +258,50 @@ public enum HKCinemaRecipeDatabase {
             id: "wkw_fallen_angels",
             title: "王家卫《堕落天使》",
             directorAndYear: "Fallen Angels (1995 · 杜可风广角暗夜)",
-            stockSummary: "EXR 5298 (+2 Push) → 2393 Print",
+            stockSummary: "EXR 5298 (+1.25 Push) → 2393",
             buildParameters: { focalMM in
                 var p = FilmSimulationParameters()
                 p.lensFocalLengthMM = focalMM
                 p.negativeStockID = "eastman_exr_500t_5298"
                 p.printStockID = "kodak_premier_2393"
                 p.filmFormatGate = .super35Motion
-                p.sceneIlluminantKelvin = 4100.0
-                p.pushPullStops = 1.85
+                p.pushPullStops = 1.25
                 p.dirCouplerAmount = 1.45
-                p.dichroicYellowCC = -10.0
+                p.dichroicYellowCC = 6.0
                 p.dichroicMagentaCC = -22.0
-                p.dichroicCyanCC = 16.0
-                p.printGammaContrast = 1.12
+                p.dichroicCyanCC = 14.0
+                p.printGammaContrast = 1.08
                 p.diffusionModel = .blackProMist1_2
-                p.bloomStrength = 0.30
+                p.bloomStrength = 0.28
                 p.halationEnabled = true
                 p.halationStrengthRGB = SIMD3<Float>(0.14, 0.035, 0.005)
-                p.opticalVignettingStrength = 0.55
-                p.grainStrength = 1.45
+                p.opticalVignettingStrength = 0.48
+                p.grainStrength = 1.35
                 return p
             }
         ),
         HKCinemaRecipe(
             id: "wkw_happy_together_color",
             title: "王家卫《春光乍泄·流金》",
-            directorAndYear: "Happy Together (1997 · 浓金青蓝印相)",
-            stockSummary: "5279 500T (+1.6 Push) → 2393",
+            directorAndYear: "Happy Together (1997 · 浓金琥珀印相)",
+            stockSummary: "5279 500T (+1.1 Push) → 2393",
             buildParameters: { focalMM in
                 var p = FilmSimulationParameters()
                 p.lensFocalLengthMM = focalMM
                 p.negativeStockID = "kodak_vision_500t_5279"
                 p.printStockID = "kodak_premier_2393"
                 p.filmFormatGate = .super35Motion
-                p.pushPullStops = 1.60
+                p.pushPullStops = 1.10
                 p.dirCouplerAmount = 1.40
-                p.dichroicYellowCC = 24.0
-                p.dichroicMagentaCC = -8.0
-                p.dichroicCyanCC = 8.0
-                p.bleachBypassAmount = 0.18
+                // Intense Buenos Aires golden-amber warmth (+26 Y, +5 M, -14 C)
+                p.dichroicYellowCC = 26.0
+                p.dichroicMagentaCC = 5.0
+                p.dichroicCyanCC = -14.0
+                p.bleachBypassAmount = 0.16
                 p.diffusionModel = .glimmerglass1_4
                 p.bloomStrength = 0.22
-                p.opticalVignettingStrength = 0.40
-                p.grainStrength = 1.35
+                p.opticalVignettingStrength = 0.36
+                p.grainStrength = 1.25
                 return p
             }
         ),
@@ -299,20 +309,20 @@ public enum HKCinemaRecipeDatabase {
             id: "wkw_happy_together_bw",
             title: "王家卫《春光乍泄·黑白》",
             directorAndYear: "Happy Together (1997 · 高反差银盐)",
-            stockSummary: "Double-X 5222 (+1.5 Push) → Ilford G4",
+            stockSummary: "Double-X 5222 (+1.1 Push) → Ilford G3.5",
             buildParameters: { focalMM in
                 var p = FilmSimulationParameters()
                 p.lensFocalLengthMM = focalMM
                 p.negativeStockID = "eastman_double_x_5222"
                 p.printStockID = "ilford_multigrade_fb"
                 p.filmFormatGate = .super35Motion
-                p.pushPullStops = 1.50
+                p.pushPullStops = 1.10
                 p.enlargerLightSource = .condenserPointSource
-                p.bwMultigradeFilterGrade = 3.8
+                p.bwMultigradeFilterGrade = 3.5
                 p.diffusionModel = .blackProMist1_8
                 p.bloomStrength = 0.18
-                p.opticalVignettingStrength = 0.40
-                p.grainStrength = 1.40
+                p.opticalVignettingStrength = 0.36
+                p.grainStrength = 1.35
                 return p
             }
         ),
@@ -320,22 +330,22 @@ public enum HKCinemaRecipeDatabase {
             id: "wkw_2046_grandmaster",
             title: "王家卫《2046 / 一代宗师》",
             directorAndYear: "2046 & The Grandmaster (黑金留银)",
-            stockSummary: "Vision3 500T + 30% Bleach Bypass → 2393",
+            stockSummary: "Vision3 500T + 28% Bleach → 2393",
             buildParameters: { focalMM in
                 var p = FilmSimulationParameters()
                 p.lensFocalLengthMM = focalMM
                 p.negativeStockID = "kodak_vision3_500t"
                 p.printStockID = "kodak_premier_2393"
                 p.filmFormatGate = .super35Motion
-                p.pushPullStops = 1.10
-                p.bleachBypassAmount = 0.30
-                p.dichroicYellowCC = 16.0
-                p.dichroicMagentaCC = 4.0
-                p.dichroicCyanCC = -4.0
-                p.printGammaContrast = 1.10
+                p.pushPullStops = 0.85
+                p.bleachBypassAmount = 0.28
+                p.dichroicYellowCC = 18.0
+                p.dichroicMagentaCC = 3.0
+                p.dichroicCyanCC = -8.0
+                p.printGammaContrast = 1.08
                 p.diffusionModel = .blackProMist1_4
                 p.bloomStrength = 0.22
-                p.opticalVignettingStrength = 0.38
+                p.opticalVignettingStrength = 0.36
                 p.grainStrength = 1.10
                 return p
             }
@@ -344,27 +354,25 @@ public enum HKCinemaRecipeDatabase {
             id: "jto_ptu_night_patrol",
             title: "杜琪峰《PTU 机动部队》",
             directorAndYear: "PTU (2003 · 郑兆强 · 银河映像冷峻暗夜)",
-            stockSummary: "5279 500T + 55% Bleach Bypass → 2393",
+            stockSummary: "5279 500T + 45% Bleach → 2393",
             buildParameters: { focalMM in
                 var p = FilmSimulationParameters()
                 p.lensFocalLengthMM = focalMM
                 p.negativeStockID = "kodak_vision_500t_5279"
                 p.printStockID = "kodak_premier_2393"
                 p.filmFormatGate = .super35Motion
-                p.sceneIlluminantKelvin = 4500.0
-                p.pushPullStops = 1.40
-                p.bleachBypassAmount = 0.55
+                p.pushPullStops = 1.00
+                p.bleachBypassAmount = 0.45
                 p.dichroicYellowCC = -14.0
                 p.dichroicMagentaCC = -6.0
-                p.dichroicCyanCC = 10.0
-                p.printGammaContrast = 1.15
+                p.dichroicCyanCC = 14.0
+                p.printGammaContrast = 1.10
                 p.enlargerLightSource = .condenserPointSource
                 p.diffusionModel = .blackProMist1_8
                 p.bloomStrength = 0.16
                 p.bloomHighlightThreshold = 0.60
-                p.blackPointOffset = 0.015
-                p.opticalVignettingStrength = 0.35
-                p.grainStrength = 1.25
+                p.opticalVignettingStrength = 0.34
+                p.grainStrength = 1.20
                 return p
             }
         ),
@@ -372,22 +380,21 @@ public enum HKCinemaRecipeDatabase {
             id: "jto_election_exiled",
             title: "杜琪峰《黑社会 / 放·逐》",
             directorAndYear: "Election & Exiled (2005–2006 · 古铜留银)",
-            stockSummary: "Eterna Vivid 8547 + 45% Bleach → 2393",
+            stockSummary: "Eterna Vivid 8547 + 38% Bleach → 2393",
             buildParameters: { focalMM in
                 var p = FilmSimulationParameters()
                 p.lensFocalLengthMM = focalMM
                 p.negativeStockID = "fujifilm_eterna_vivid_500t_8547"
                 p.printStockID = "kodak_premier_2393"
                 p.filmFormatGate = .super35Motion
-                p.pushPullStops = 1.10
-                p.bleachBypassAmount = 0.45
-                p.dichroicYellowCC = 12.0
-                p.dichroicMagentaCC = -5.0
-                p.dichroicCyanCC = 4.0
-                p.printGammaContrast = 1.12
-                p.blackPointOffset = 0.018
-                p.opticalVignettingStrength = 0.36
-                p.grainStrength = 1.20
+                p.pushPullStops = 0.90
+                p.bleachBypassAmount = 0.38
+                p.dichroicYellowCC = 15.0
+                p.dichroicMagentaCC = -4.0
+                p.dichroicCyanCC = -5.0
+                p.printGammaContrast = 1.08
+                p.opticalVignettingStrength = 0.34
+                p.grainStrength = 1.18
                 return p
             }
         ),
@@ -395,20 +402,19 @@ public enum HKCinemaRecipeDatabase {
             id: "jto_the_mission",
             title: "杜琪峰《枪火 / 暗战》",
             directorAndYear: "The Mission (1999 · 冷蓝钢灰枪战)",
-            stockSummary: "EXR 5298 + 30% Bleach Bypass → 2383",
+            stockSummary: "EXR 5298 + 28% Bleach → 2383",
             buildParameters: { focalMM in
                 var p = FilmSimulationParameters()
                 p.lensFocalLengthMM = focalMM
                 p.negativeStockID = "eastman_exr_500t_5298"
                 p.printStockID = "kodak_vision_2383"
                 p.filmFormatGate = .super35Motion
-                p.sceneIlluminantKelvin = 4700.0
-                p.pushPullStops = 0.90
-                p.bleachBypassAmount = 0.32
-                p.dichroicYellowCC = -16.0
-                p.dichroicMagentaCC = -4.0
+                p.pushPullStops = 0.75
+                p.bleachBypassAmount = 0.28
+                p.dichroicYellowCC = -15.0
+                p.dichroicMagentaCC = -3.0
                 p.dichroicCyanCC = 12.0
-                p.printGammaContrast = 1.10
+                p.printGammaContrast = 1.08
                 p.opticalVignettingStrength = 0.30
                 p.grainStrength = 1.15
                 return p

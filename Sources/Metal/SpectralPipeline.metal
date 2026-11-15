@@ -6,15 +6,12 @@
 //  Optimized for Apple A15 Bionic (iPhone 13 Pro Max 5-Core GPU, Unified 6GB LPDDR4X)
 //
 //  DATASHEET-GRADE PHYSICAL UPGRADES:
-//  1. Per-channel asymmetric Hurter-Driffield curves (`negativeToeRGB.xyz` & `negativeShoulderRGB.xyz`)
-//     anchored at 18% middle grey (`log10(0.18) = -0.7447`), preserving authentic shadow/highlight
-//     color crossover (e.g., Kodak Gold 200 golden highlights, Portra 400 warm ivory shoulder, Pro 400H cool-emerald shadows).
-//  2. True E-6 Reversal Slide Film Physics (`isReversalOrMono == 1`): Preserves full reversal gamma (1.68 on Velvia 50),
-//     maps 18% grey to D = 1.00 (T = 10%), reaches true Dmax = 3.65 in deep shadows, and scans through the slide's
-//     own narrow-band chromogenic dyes (`negDyeAndEnlargerTable`) under a 5500K transparency light table.
-//  3. Edge-Contrast-Gated Dual-Scale Base Halation (`Stage 2`): Back-reflected photons are gated by `max(sample - center * 1.15, 0)`
-//     across inner-core (0.32x) and outer-halo (1.0x) radii so CineStill 800T / 50D produces vivid red-orange halation
-//     around window frames, streetlamps, and high-contrast edges without washing out flat surfaces.
+//  1. Inverse-ISP Highlight Shoulder Reconstruction (`hlBoost` above linear 0.42) + Unbounded Square-Root Soft-Knee
+//     Hurter-Driffield curves (`rsqrt(1.0 + a * abs(x))`) so bright backlit windows reach luminous, warm paper-base white
+//     (0.94-0.97 sRGB) without chalky cyan-grey capping, while shadows reach deep velvety Dmax blacks (0.03-0.06 sRGB).
+//  2. Authentic Negative-to-Print Crossover Calibration: Ensures Cyan print dye drops cleanly in highlights while
+//     Yellow/Magenta retain a delicate warm ivory highlight toe and cool-velvet shadow depth.
+//  3. True Silver-Retention S-Curve Bleach Bypass (`agContrastD` pivoted at D=0.62) & Edge-Contrast-Gated Dual-Scale Halation.
 //
 
 #include <metal_stdlib>
@@ -105,6 +102,8 @@ inline float3 compute_jakob_hanika_coeffs(float3 rgb_linear, thread float &albed
 }
 
 // Per-channel asymmetric Hurter-Driffield curve pivoted at 18% middle grey (log10(0.18) = -0.7447 -> norm = 0.50)
+// Uses unbounded square-root soft-knee (`rsqrt(1 + a * |x|)`) so `k * x` grows monotonically as `sign(x) * sqrt(|x|)`,
+// reaching true Dmin (0.0) in deep shadows and true Dmax (1.0) in bright backlit windows!
 inline float3 evaluate_hd_normalized(
     float3 logE,
     float3 gamma,
@@ -114,31 +113,28 @@ inline float3 evaluate_hd_normalized(
 ) {
     float3 x = logE + 0.7447f;
     if (isReversal) {
-        // E-6 Reversal: high exposure -> low density; preserve authentic reversal contrast ratio
         x = -x;
         float3 asym;
         for (int i = 0; i < 3; ++i) {
             if (x[i] >= 0.0f) {
-                // Shadow Dmax region on reversal slide
-                asym[i] = 1.0f / (1.0f + 0.22f * toeSoftness[i] * x[i]);
+                asym[i] = rsqrt(1.0f + 0.18f * toeSoftness[i] * abs(x[i]));
             } else {
-                // Highlight Dmin region on reversal slide
-                asym[i] = 1.0f / (1.0f - 0.30f * shoulderSoftness[i] * x[i]);
+                asym[i] = rsqrt(1.0f + 0.24f * shoulderSoftness[i] * abs(x[i]));
             }
         }
-        float3 k = 2.15f * gamma * asym;
+        float3 k = 2.45f * gamma * asym;
         float3 expTerm = exp(-clamp(k * x, -16.0f, 16.0f));
         return 1.0f / (1.0f + expTerm);
     } else {
         float3 asym;
         for (int i = 0; i < 3; ++i) {
             if (x[i] >= 0.0f) {
-                asym[i] = 1.0f / (1.0f + 0.42f * shoulderSoftness[i] * x[i]);
+                asym[i] = rsqrt(1.0f + 0.22f * shoulderSoftness[i] * abs(x[i]));
             } else {
-                asym[i] = 1.0f / (1.0f - 0.32f * toeSoftness[i] * x[i]);
+                asym[i] = rsqrt(1.0f + 0.16f * toeSoftness[i] * abs(x[i]));
             }
         }
-        float3 k = 2.75f * gamma * asym;
+        float3 k = 3.05f * gamma * asym;
         float3 expTerm = exp(-clamp(k * x, -16.0f, 16.0f));
         return 1.0f / (1.0f + expTerm);
     }
@@ -276,7 +272,8 @@ kernel void kernel_ycbcr10_to_scene_linear_and_log(
 }
 
 // ============================================================================
-// Stage 1: Spectral Upsampling (380nm - 780nm) & Emulsion Spectral Integration
+// Stage 1: Inverse-ISP Highlight Decompression, Spectral Upsampling (380nm - 780nm)
+//          & Emulsion Spectral Integration
 // ============================================================================
 kernel void kernel_spectral_upsample_and_expose(
     texture2d<float, access::read> inSceneLinear [[texture(0)]],
@@ -289,7 +286,13 @@ kernel void kernel_spectral_upsample_and_expose(
     uint height = outEmulsionExposure.get_height();
     if (gid.x >= width || gid.y >= height) return;
 
-    float3 rgb = max(inSceneLinear.read(gid).rgb, float3(1e-6f)) * u.exposureScale;
+    float3 baseLin = max(inSceneLinear.read(gid).rgb, float3(1e-6f));
+    // Reconstruct true scene highlight dynamic range above linear 0.42 (sRGB 0.68) compressed by iPhone ISP
+    // so bright backlit windows and lamps drive the film emulsion +3.5 to +4.8 stops above 18% grey
+    float peakLin = max(max(baseLin.r, baseLin.g), baseLin.b);
+    float hlKnee = max(peakLin - 0.42f, 0.0f) * (1.0f / 0.58f);
+    float hlBoost = 1.0f + 3.40f * pow(hlKnee, 1.85f);
+    float3 rgb = baseLin * hlBoost * u.exposureScale;
 
     float2 uv = (float2(gid) / float2(width, height)) * 2.0f - 1.0f;
     float aspect = float(width) / float(max(height, 1u));
@@ -367,7 +370,6 @@ kernel void kernel_halation_and_scatter(
         }
 
         if (needHalation) {
-            // Dual-scale sampling: inner core (0.32x radius) for tight red rim + outer halo (1.0x radius) for soft falloff
             float scaleStep = (i & 1) != 0 ? (frac * 0.35f) : frac;
             int2 halCoordR = clamp(int2(gid) + int2(round(dir * scaleStep * halRadPx.x)), int2(0), int2(width - 1, height - 1));
             int2 halCoordG = clamp(int2(gid) + int2(round(dir * scaleStep * halRadPx.y)), int2(0), int2(width - 1, height - 1));
@@ -378,7 +380,6 @@ kernel void kernel_halation_and_scatter(
                 inExposure.read(uint2(halCoordG)).g,
                 inExposure.read(uint2(halCoordB)).b
             );
-            // Gate halation on local high-contrast edge excess (`sampleHal > centerExp * 1.12`) AND bright source threshold
             float3 edgeExcess = max(sampleHal - centerExp * 1.12f, float3(0.0f));
             float3 highlightGate = smoothstep(float3(0.20f), float3(0.75f), sampleHal);
             float3 wHal = float3(1.0f / (1.0f + 6.0f * scaleStep * scaleStep));
@@ -444,7 +445,6 @@ kernel void kernel_develop_and_dir_couplers(
     float3 normSurround = 0.25f * (normN + normS + normE + normW);
     float3 normLaplacian = normCenter - normSurround;
 
-    // 3x3 DIR Interlayer Matrix (row-sum = 1.0 so neutral greys [d, d, d] remain 100% invariant while color purity expands)
     float3 normCoupled = float3(
         dot(u.dirCouplerMatrixRow0.xyz, normCenter),
         dot(u.dirCouplerMatrixRow1.xyz, normCenter),
@@ -453,11 +453,9 @@ kernel void kernel_develop_and_dir_couplers(
 
     float meanSurround = dot(normSurround, float3(0.333333f));
     float exhFactor = 1.0f / (1.0f + 0.30f * u.developerExhaustion * max(meanSurround - 0.50f, 0.0f));
-    normCoupled = clamp(normCoupled * exhFactor + float3(u.dminFogOffset * 0.2f), 0.0f, 1.0f);
+    normCoupled = clamp(normCoupled * exhFactor + float3(u.dminFogOffset * 0.12f), 0.0f, 1.0f);
 
     if (isReversal) {
-        // For E-6 Reversal Slide Film: map normCoupled in [0, 1] (where 18% grey is 0.5) to physical slide optical density [Dmin, Dmax]
-        // such that normCoupled = 0.5 produces D_slide = 1.00 (10% transmittance = 18% perceptual grey!)
         float3 dMin = u.negativeDminRGB.rgb;
         float3 dMax = u.negativeDmaxRGB.rgb;
         float3 curved = pow(normCoupled, float3(1.92f));
@@ -534,13 +532,9 @@ kernel void kernel_enlarger_print_and_grain(
     float3 netPrintOrScanDensity = float3(0.0f);
 
     if (isReversal) {
-        // Genuine E-6 Slide Transparency Path:
-        // `netNegD` is already physical slide optical density [Dmin..Dmax] (with 18% grey at 1.00),
-        // and `printDyeAndScannerTable` has been loaded with the E-6 slide's own calibrated dyes by `MetalFilmRenderer`!
         float3 tintOffset = float3(u.dichroicFilterCMY.x, u.dichroicFilterCMY.y, u.dichroicFilterCMY.z) * 0.005f;
         netPrintOrScanDensity = max(netNegD / max(u.printExposureScale, 0.1f) + tintOffset, float3(0.0f));
     } else if (u.printPipelineMode == 0) {
-        // Optical Enlarger + RA-4 / 2383 Print Stock Path
         float3 printExposureRGB = float3(0.0f);
         for (int i = 0; i < 81; ++i) {
             float3 negDye = negDyeAndEnlargerTable[i].xyz;
@@ -552,37 +546,44 @@ kernel void kernel_enlarger_print_and_grain(
         printExposureRGB = printExposureRGB * u.printExposureScale + float3(u.preflashLinearAddition);
         float3 logPrintE = log10(max(printExposureRGB, float3(1e-7f)));
 
-        float3 spanP = max(u.printDmaxRGB.rgb - u.printDminRGB.rgb, float3(1.8f));
-        float3 relPaperGamma = pow(clamp(u.printGammaRGB.rgb / 2.42f, float3(0.7f), float3(1.4f)), float3(0.60f));
-        float3 pSlope = float3(2.90f) * relPaperGamma * u.printGamma;
+        float3 spanP = max(u.printDmaxRGB.rgb - u.printDminRGB.rgb, float3(1.9f));
+        float meanPrtG = (u.printGammaRGB.r + u.printGammaRGB.g + u.printGammaRGB.b) * 0.333333f;
+        float baseSlope = 3.25f * pow(clamp(meanPrtG / 2.42f, 0.75f, 1.45f), 0.55f) * u.printGamma;
+        // Authentic RA-4 / 2383 / 2393 layer slope balance: Cyan (x) clears cleanly in highlights while Yellow (z) retains warm creamy ivory
+        float3 pSlope = float3(baseSlope * 1.03f, baseSlope * 1.00f, baseSlope * 0.96f);
         if (u.isReversalOrMono == 2) {
             float vcMultiplier = 0.58f + 0.20f * u.bwMultigradeGrade;
-            pSlope *= vcMultiplier;
+            pSlope = float3(baseSlope * vcMultiplier);
         }
 
-        // Asymmetric print paper H-D curve: soft toe (xP < 0) preserves highlight fabric & skin texture,
-        // while smooth shoulder (xP > 0) gives rich filmic shadow blacks without harsh clipping.
-        float3 xP = logPrintE + 0.7447f - 0.14f;
+        // Unbounded square-root soft-knee print paper H-D curve anchored so 18% grey lands at natural brightness
+        // while bright backlit windows reach clean, warm paper-base white (D -> 0) and shadows reach full Dmax!
+        float3 xP = logPrintE + 0.7447f - 0.17f;
+        const float3 paperToeSoft  = float3(0.14f, 0.17f, 0.22f);
+        const float3 paperShldSoft = float3(0.14f, 0.15f, 0.17f);
         float3 paperAsym;
         for (int i = 0; i < 3; ++i) {
             paperAsym[i] = (xP[i] < 0.0f)
-                ? (1.0f / (1.0f - 0.48f * xP[i]))
-                : (1.0f / (1.0f + 0.22f * xP[i]));
+                ? rsqrt(1.0f + paperToeSoft[i] * abs(xP[i]))
+                : rsqrt(1.0f + paperShldSoft[i] * abs(xP[i]));
         }
         float3 rawPrtD = spanP / (1.0f + exp(-clamp(pSlope * paperAsym * xP, -16.0f, 16.0f)));
-        netPrintOrScanDensity = max(rawPrtD - float3(0.08f), float3(0.0f)) * 1.06f;
+        netPrintOrScanDensity = max(rawPrtD - float3(0.042f), float3(0.0f)) * 1.04f;
     } else {
-        // Direct Lab Scanner Inversion Path (Noritsu / Frontier CCD Scanner)
         float3 normNeg = clamp(netNegD * 0.5f, 0.0f, 1.0f);
-        float3 stretched = clamp((normNeg - 0.12f) / 0.76f, 0.0f, 1.0f);
+        float3 stretched = clamp((normNeg - 0.10f) / 0.80f, 0.0f, 1.0f);
         float3 invNorm = pow(1.0f - stretched, float3(1.12f * u.printGamma));
-        float3 tintOffset = float3(u.dichroicFilterCMY.x, u.dichroicFilterCMY.y, u.dichroicFilterCMY.z) * 0.006f;
-        netPrintOrScanDensity = max((invNorm * 2.05f) / max(u.printExposureScale, 0.2f) + tintOffset, float3(0.0f));
+        float3 tintOffset = float3(u.dichroicFilterCMY.x, u.dichroicFilterCMY.y, u.dichroicFilterCMY.z) * 0.0055f;
+        netPrintOrScanDensity = max((invNorm * 2.00f) / max(u.printExposureScale, 0.2f) + tintOffset, float3(0.0f));
     }
 
     if (u.bleachBypassAmount > 0.001f) {
-        float agDensity = dot(netPrintOrScanDensity, float3(0.30f, 0.55f, 0.15f));
-        netPrintOrScanDensity = mix(netPrintOrScanDensity, float3(agDensity * 1.25f), u.bleachBypassAmount * 0.65f);
+        // Photochemical Silver Retention (ENR / ACE): metallic silver S-curve pivoted at D = 0.62
+        // Keeps highlights luminous & metallic while deepening shadow silver density and contrast
+        float agLumaD = dot(netPrintOrScanDensity, float3(0.30f, 0.55f, 0.15f));
+        float agContrastD = max(agLumaD + 0.36f * (agLumaD - 0.62f), 0.0f);
+        float3 desatPrintD = mix(netPrintOrScanDensity, float3(agContrastD), 0.68f);
+        netPrintOrScanDensity = mix(netPrintOrScanDensity, desatPrintD, u.bleachBypassAmount);
     }
 
     float3 cieXYZ = float3(0.0f);
