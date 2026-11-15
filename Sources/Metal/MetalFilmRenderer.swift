@@ -22,7 +22,10 @@ public final class MetalFilmRenderer {
     public let photoCommandQueue: MTLCommandQueue
     private var textureCache: CVMetalTextureCache?
 
-    private let pipeYCbCr10ToLinearAndLog: MTLComputePipelineState
+    private let pipeRTHaloExtractHoriz: MTLComputePipelineState
+    private let pipeRTHaloBlurVert: MTLComputePipelineState
+    private let pipeFusedRealtimeDarkroom: MTLComputePipelineState
+    private let pipeEncodeCleanLogBGRA8: MTLComputePipelineState
     private let pipeSpectralUpsampleExpose: MTLComputePipelineState
     private let pipeHalationBloomHorizontal: MTLComputePipelineState
     private let pipeHalationAndScatter: MTLComputePipelineState
@@ -32,15 +35,10 @@ public final class MetalFilmRenderer {
 
     private let bufCIE1931XYZ: MTLBuffer
 
-    private var texSceneLinear: MTLTexture?
+    private var texHaloHoriz: MTLTexture?
+    private var texHaloBlur: MTLTexture?
     private var texStepPrintAccum: MTLTexture?
-    private var texLogEncoded: MTLTexture?
-    private var texEmulsionExposure: MTLTexture?
-    private var texHorizHalo: MTLTexture?
-    private var texScatteredExposure: MTLTexture?
-    private var texNegativeDensity: MTLTexture?
-    private var texFilmRendered: MTLTexture?
-    private var currentAllocatedSize: (width: Int, height: Int) = (0, 0)
+    private var currentHaloSize: (width: Int, height: Int) = (0, 0)
 
     private let photoRenderLock = NSLock()
     private var texPhotoPing: MTLTexture?
@@ -88,7 +86,10 @@ public final class MetalFilmRenderer {
         self.textureCache = cache
 
         do {
-            guard let fn0 = library.makeFunction(name: "kernel_ycbcr10_to_scene_linear_and_log"),
+            guard let fnRTH = library.makeFunction(name: "kernel_rt_halo_extract_horiz"),
+                  let fnRTV = library.makeFunction(name: "kernel_rt_halo_blur_vert"),
+                  let fnFused = library.makeFunction(name: "kernel_fused_realtime_darkroom"),
+                  let fnLog = library.makeFunction(name: "kernel_encode_clean_log_bgra8"),
                   let fn1 = library.makeFunction(name: "kernel_spectral_upsample_and_expose"),
                   let fn2h = library.makeFunction(name: "kernel_halation_bloom_horizontal"),
                   let fn2 = library.makeFunction(name: "kernel_halation_and_scatter"),
@@ -97,7 +98,10 @@ public final class MetalFilmRenderer {
                   let fn5 = library.makeFunction(name: "kernel_present_or_record_bgra8") else {
                 return nil
             }
-            self.pipeYCbCr10ToLinearAndLog = try dev.makeComputePipelineState(function: fn0)
+            self.pipeRTHaloExtractHoriz = try dev.makeComputePipelineState(function: fnRTH)
+            self.pipeRTHaloBlurVert = try dev.makeComputePipelineState(function: fnRTV)
+            self.pipeFusedRealtimeDarkroom = try dev.makeComputePipelineState(function: fnFused)
+            self.pipeEncodeCleanLogBGRA8 = try dev.makeComputePipelineState(function: fnLog)
             self.pipeSpectralUpsampleExpose = try dev.makeComputePipelineState(function: fn1)
             self.pipeHalationBloomHorizontal = try dev.makeComputePipelineState(function: fn2h)
             self.pipeHalationAndScatter = try dev.makeComputePipelineState(function: fn2)
@@ -133,28 +137,23 @@ public final class MetalFilmRenderer {
         )
     }
 
-    public func ensureTransientTextures(width: Int, height: Int) {
-        guard width > 0 && height > 0 else { return }
-        guard width != currentAllocatedSize.width || height != currentAllocatedSize.height else { return }
+    public func ensureHaloPyramidTextures(haloW: Int, haloH: Int) {
+        guard haloW > 0 && haloH > 0 else { return }
+        guard haloW != currentHaloSize.width || haloH != currentHaloSize.height || texHaloHoriz == nil || texHaloBlur == nil || texStepPrintAccum == nil else { return }
 
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba16Float,
-            width: width,
-            height: height,
+            width: haloW,
+            height: haloH,
             mipmapped: false
         )
         desc.usage = [.shaderRead, .shaderWrite]
         desc.storageMode = .private
 
-        self.texSceneLinear = device.makeTexture(descriptor: desc)
+        self.texHaloHoriz = device.makeTexture(descriptor: desc)
+        self.texHaloBlur = device.makeTexture(descriptor: desc)
         self.texStepPrintAccum = device.makeTexture(descriptor: desc)
-        self.texLogEncoded = device.makeTexture(descriptor: desc)
-        self.texEmulsionExposure = device.makeTexture(descriptor: desc)
-        self.texHorizHalo = device.makeTexture(descriptor: desc)
-        self.texScatteredExposure = device.makeTexture(descriptor: desc)
-        self.texNegativeDensity = device.makeTexture(descriptor: desc)
-        self.texFilmRendered = device.makeTexture(descriptor: desc)
-        self.currentAllocatedSize = (width, height)
+        self.currentHaloSize = (haloW, haloH)
     }
 
     private func ensurePhotoPingPongTextures(width: Int, height: Int) -> (MTLTexture, MTLTexture, MTLTexture)? {
@@ -532,7 +531,7 @@ public final class MetalFilmRenderer {
         inFlightSemaphore.signal()
     }
 
-    // MARK: - 1. Flicker-Free 60fps Viewfinder + GPU-Synchronized Video Recording
+    // MARK: - 1. Zero-Intermediate-DRAM Fused 4K Video + ProMotion Viewfinder
     public func renderViewfinderDrawable(
         pixelBuffer: CVPixelBuffer,
         params: FilmSimulationParameters,
@@ -540,7 +539,7 @@ public final class MetalFilmRenderer {
         drawable: CAMetalDrawable,
         recordingPixelBuffer: CVPixelBuffer? = nil,
         recordBakedFilm: Bool = true,
-        maxWorkLongEdge: Int = 840,
+        maxWorkLongEdge: Int = 1920,
         onRecordingFrameCompleted: (() -> Void)? = nil
     ) -> Bool {
         guard let cache = textureCache,
@@ -558,21 +557,15 @@ public final class MetalFilmRenderer {
             return false
         }
 
-        let maxLongEdge: Int = max(640, maxWorkLongEdge)
-        let scale: Float = min(1.0, Float(maxLongEdge) / Float(max(srcW, srcH)))
-        let workW = max(Int(Float(srcW) * scale), 320)
-        let workH = max(Int(Float(srcH) * scale), 320)
+        // 1/4-resolution continuous Gaussian Halo Pyramid (e.g., 480x270 or 540x360: 16x fewer pixels than full 4K!)
+        let haloScale: Float = min(0.25, 480.0 / Float(max(srcW, srcH)))
+        let haloW = max(Int(Float(srcW) * haloScale), 160)
+        let haloH = max(Int(Float(srcH) * haloScale), 160)
+        ensureHaloPyramidTextures(haloW: haloW, haloH: haloH)
 
-        ensureTransientTextures(width: workW, height: workH)
-
-        guard let texLinear = texSceneLinear,
-              let texStepAccum = texStepPrintAccum,
-              let texLog = texLogEncoded,
-              let texExp = texEmulsionExposure,
-              let texHHalo = texHorizHalo,
-              let texScat = texScatteredExposure,
-              let texNeg = texNegativeDensity,
-              let texFilm = texFilmRendered else {
+        guard let texHHoriz = texHaloHoriz,
+              let texHBlur = texHaloBlur,
+              let texStepAccum = texStepPrintAccum else {
             inFlightSemaphore.signal()
             return false
         }
@@ -596,74 +589,12 @@ public final class MetalFilmRenderer {
             return false
         }
 
-        let tgSize = MTLSize(width: 16, height: 16, depth: 1)
-        let tgCount = MTLSize(width: (workW + 15) / 16, height: (workH + 15) / 16, depth: 1)
-
-        var logModeRaw = Int32(logCurve.rawValue)
-        var is10BitFlag: Int32 = is10Bit ? 1 : 0
-        var stepPrintVal: Float = params.stepPrintTrail
-        encoder.setComputePipelineState(pipeYCbCr10ToLinearAndLog)
-        encoder.setTexture(lumaTex, index: 0)
-        encoder.setTexture(chromaTex, index: 1)
-        encoder.setTexture(texLinear, index: 2)
-        encoder.setTexture(texLog, index: 3)
-        encoder.setTexture(texStepAccum, index: 4)
-        encoder.setBytes(&logModeRaw, length: MemoryLayout<Int32>.stride, index: 0)
-        encoder.setBytes(&is10BitFlag, length: MemoryLayout<Int32>.stride, index: 1)
-        encoder.setBytes(&stepPrintVal, length: MemoryLayout<Float>.stride, index: 2)
-        encoder.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
-
-        var pack = buildMetalUniformsAndTables(params: params, imageWidth: workW)
-        let tableBytes = 81 * MemoryLayout<SIMD4<Float>>.stride
-
-        encoder.setComputePipelineState(pipeSpectralUpsampleExpose)
-        encoder.setTexture(texLinear, index: 0)
-        encoder.setTexture(texExp, index: 1)
-        encoder.setBytes(&pack.uniforms, length: MemoryLayout<MetalFilmUniforms>.stride, index: 0)
-        encoder.setBytes(&pack.sens, length: tableBytes, index: 1)
-        encoder.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
-
-        encoder.setComputePipelineState(pipeHalationBloomHorizontal)
-        encoder.setTexture(texExp, index: 0)
-        encoder.setTexture(texHHalo, index: 1)
-        encoder.setBytes(&pack.uniforms, length: MemoryLayout<MetalFilmUniforms>.stride, index: 0)
-        encoder.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
-
-        encoder.setComputePipelineState(pipeHalationAndScatter)
-        encoder.setTexture(texExp, index: 0)
-        encoder.setTexture(texScat, index: 1)
-        encoder.setTexture(texHHalo, index: 2)
-        encoder.setBytes(&pack.uniforms, length: MemoryLayout<MetalFilmUniforms>.stride, index: 0)
-        encoder.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
-
-        encoder.setComputePipelineState(pipeDevelopAndDIRCouplers)
-        encoder.setTexture(texScat, index: 0)
-        encoder.setTexture(texNeg, index: 1)
-        encoder.setBytes(&pack.uniforms, length: MemoryLayout<MetalFilmUniforms>.stride, index: 0)
-        encoder.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
-
-        encoder.setComputePipelineState(pipeEnlargerPrintAndGrain)
-        encoder.setTexture(texNeg, index: 0)
-        encoder.setTexture(texFilm, index: 1)
-        encoder.setBytes(&pack.uniforms, length: MemoryLayout<MetalFilmUniforms>.stride, index: 0)
-        encoder.setBytes(&pack.negDye, length: tableBytes, index: 1)
-        encoder.setBytes(&pack.prtSens, length: tableBytes, index: 2)
-        encoder.setBytes(&pack.prtDye, length: tableBytes, index: 3)
-        encoder.setBuffer(bufCIE1931XYZ, offset: 0, index: 4)
-        encoder.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
-
         let outDrawableTex = drawable.texture
         let dstW = outDrawableTex.width
         let dstH = outDrawableTex.height
-        let dstTGCount = MTLSize(width: (dstW + 15) / 16, height: (dstH + 15) / 16, depth: 1)
-
-        encoder.setComputePipelineState(pipePresentOrRecordBGRA8)
-        encoder.setTexture(texFilm, index: 0)
-        encoder.setTexture(outDrawableTex, index: 1)
-        encoder.dispatchThreadgroups(dstTGCount, threadsPerThreadgroup: tgSize)
 
         var cvRecordTex: CVMetalTexture?
-        var didEncodeRecording = false
+        var recMetalTex: MTLTexture? = nil
         if let recPB = recordingPixelBuffer {
             let recW = CVPixelBufferGetWidth(recPB)
             let recH = CVPixelBufferGetHeight(recPB)
@@ -678,11 +609,88 @@ public final class MetalFilmRenderer {
                 0,
                 &cvRecordTex
             )
-            if let recMetalTex = cvRecordTex.flatMap({ CVMetalTextureGetTexture($0) }) {
-                let recTGCount = MTLSize(width: (recW + 15) / 16, height: (recH + 15) / 16, depth: 1)
-                encoder.setComputePipelineState(pipePresentOrRecordBGRA8)
-                encoder.setTexture(recordBakedFilm ? texFilm : texLog, index: 0)
-                encoder.setTexture(recMetalTex, index: 1)
+            recMetalTex = cvRecordTex.flatMap({ CVMetalTextureGetTexture($0) })
+        }
+
+        let targetFilmW = (recMetalTex != nil && recordBakedFilm) ? recMetalTex!.width : dstW
+        let targetFilmH = (recMetalTex != nil && recordBakedFilm) ? recMetalTex!.height : dstH
+
+        var pack = buildMetalUniformsAndTables(params: params, imageWidth: targetFilmW, isRealtimeFastMode: true)
+        let tableBytes = 81 * MemoryLayout<SIMD4<Float>>.stride
+        var is10BitFlag: Int32 = is10Bit ? 1 : 0
+        let tgSize = MTLSize(width: 16, height: 16, depth: 1)
+
+        // Pass 1A & 1B: Continuous 11x11 Separable Gaussian Halation & Bloom on 1/4-Res Pyramid
+        let haloTGCount = MTLSize(width: (haloW + 15) / 16, height: (haloH + 15) / 16, depth: 1)
+        encoder.setComputePipelineState(pipeRTHaloExtractHoriz)
+        encoder.setTexture(lumaTex, index: 0)
+        encoder.setTexture(chromaTex, index: 1)
+        encoder.setTexture(texHHoriz, index: 2)
+        encoder.setBytes(&pack.uniforms, length: MemoryLayout<MetalFilmUniforms>.stride, index: 0)
+        encoder.setBytes(&is10BitFlag, length: MemoryLayout<Int32>.stride, index: 1)
+        encoder.dispatchThreadgroups(haloTGCount, threadsPerThreadgroup: tgSize)
+
+        encoder.setComputePipelineState(pipeRTHaloBlurVert)
+        encoder.setTexture(texHHoriz, index: 0)
+        encoder.setTexture(texHBlur, index: 1)
+        encoder.setBytes(&pack.uniforms, length: MemoryLayout<MetalFilmUniforms>.stride, index: 0)
+        encoder.dispatchThreadgroups(haloTGCount, threadsPerThreadgroup: tgSize)
+
+        var didEncodeRecording = false
+
+        if let validRecTex = recMetalTex, recordBakedFilm {
+            // Recording Baked Physical Film: Render 1:1 at full native recording resolution (e.g. 3840x2160 4K) directly into validRecTex!
+            let recTGCount = MTLSize(width: (validRecTex.width + 15) / 16, height: (validRecTex.height + 15) / 16, depth: 1)
+            encoder.setComputePipelineState(pipeFusedRealtimeDarkroom)
+            encoder.setTexture(lumaTex, index: 0)
+            encoder.setTexture(chromaTex, index: 1)
+            encoder.setTexture(texHBlur, index: 2)
+            encoder.setTexture(texStepAccum, index: 3)
+            encoder.setTexture(validRecTex, index: 4)
+            encoder.setBytes(&pack.uniforms, length: MemoryLayout<MetalFilmUniforms>.stride, index: 0)
+            encoder.setBytes(&pack.sens, length: tableBytes, index: 1)
+            encoder.setBytes(&pack.negDye, length: tableBytes, index: 2)
+            encoder.setBytes(&pack.prtSens, length: tableBytes, index: 3)
+            encoder.setBytes(&pack.prtDye, length: tableBytes, index: 4)
+            encoder.setBuffer(bufCIE1931XYZ, offset: 0, index: 5)
+            encoder.setBytes(&is10BitFlag, length: MemoryLayout<Int32>.stride, index: 6)
+            encoder.dispatchThreadgroups(recTGCount, threadsPerThreadgroup: tgSize)
+            didEncodeRecording = true
+
+            // Blit recorded full-res film frame onto the viewfinder drawable
+            let dstTGCount = MTLSize(width: (dstW + 15) / 16, height: (dstH + 15) / 16, depth: 1)
+            encoder.setComputePipelineState(pipePresentOrRecordBGRA8)
+            encoder.setTexture(validRecTex, index: 0)
+            encoder.setTexture(outDrawableTex, index: 1)
+            encoder.dispatchThreadgroups(dstTGCount, threadsPerThreadgroup: tgSize)
+        } else {
+            // Viewfinder Preview (or Clean Log recording with Live Film Viewfinder): Render directly into outDrawableTex!
+            let dstTGCount = MTLSize(width: (dstW + 15) / 16, height: (dstH + 15) / 16, depth: 1)
+            encoder.setComputePipelineState(pipeFusedRealtimeDarkroom)
+            encoder.setTexture(lumaTex, index: 0)
+            encoder.setTexture(chromaTex, index: 1)
+            encoder.setTexture(texHBlur, index: 2)
+            encoder.setTexture(texStepAccum, index: 3)
+            encoder.setTexture(outDrawableTex, index: 4)
+            encoder.setBytes(&pack.uniforms, length: MemoryLayout<MetalFilmUniforms>.stride, index: 0)
+            encoder.setBytes(&pack.sens, length: tableBytes, index: 1)
+            encoder.setBytes(&pack.negDye, length: tableBytes, index: 2)
+            encoder.setBytes(&pack.prtSens, length: tableBytes, index: 3)
+            encoder.setBytes(&pack.prtDye, length: tableBytes, index: 4)
+            encoder.setBuffer(bufCIE1931XYZ, offset: 0, index: 5)
+            encoder.setBytes(&is10BitFlag, length: MemoryLayout<Int32>.stride, index: 6)
+            encoder.dispatchThreadgroups(dstTGCount, threadsPerThreadgroup: tgSize)
+
+            if let validRecTex = recMetalTex {
+                // Encode Clean Log at full native 4K / 1080p / 720p directly into validRecTex
+                var logModeRaw = Int32(logCurve.rawValue)
+                let recTGCount = MTLSize(width: (validRecTex.width + 15) / 16, height: (validRecTex.height + 15) / 16, depth: 1)
+                encoder.setComputePipelineState(pipeEncodeCleanLogBGRA8)
+                encoder.setTexture(lumaTex, index: 0)
+                encoder.setTexture(chromaTex, index: 1)
+                encoder.setTexture(validRecTex, index: 2)
+                encoder.setBytes(&logModeRaw, length: MemoryLayout<Int32>.stride, index: 0)
+                encoder.setBytes(&is10BitFlag, length: MemoryLayout<Int32>.stride, index: 1)
                 encoder.dispatchThreadgroups(recTGCount, threadsPerThreadgroup: tgSize)
                 didEncodeRecording = true
             }

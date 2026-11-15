@@ -100,7 +100,7 @@ public enum VideoResolutionPreset: String, CaseIterable, Identifiable, Equatable
         switch self {
         case .hd720p:  return 22_000_000
         case .fhd1080: return 50_000_000
-        case .uhd4k:   return 115_000_000
+        case .uhd4k:   return 72_000_000
         }
     }
 }
@@ -189,7 +189,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
     public let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "com.spektracam.sessionQueue", qos: .userInitiated)
     private let videoProcessingQueue = DispatchQueue(label: "com.spektracam.videoProcessingQueue", qos: .userInteractive)
-    private let videoWriterQueue = DispatchQueue(label: "com.spektracam.videoWriterQueue", qos: .userInitiated)
+    private let videoWriterQueue = DispatchQueue(label: "com.spektracam.videoWriterQueue", qos: .userInteractive)
     private let photoRenderQueue = DispatchQueue(label: "com.spektracam.photoRenderQueue", qos: .userInitiated)
 
     private var videoDeviceInput: AVCaptureDeviceInput?
