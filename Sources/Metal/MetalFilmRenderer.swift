@@ -504,6 +504,7 @@ public final class MetalFilmRenderer {
         drawable: CAMetalDrawable,
         recordingPixelBuffer: CVPixelBuffer? = nil,
         recordBakedFilm: Bool = true,
+        maxWorkLongEdge: Int = 840,
         onRecordingFrameCompleted: (() -> Void)? = nil
     ) -> Bool {
         guard let cache = textureCache,
@@ -521,7 +522,7 @@ public final class MetalFilmRenderer {
             return false
         }
 
-        let maxLongEdge: Int = 840
+        let maxLongEdge: Int = max(640, maxWorkLongEdge)
         let scale: Float = min(1.0, Float(maxLongEdge) / Float(max(srcW, srcH)))
         let workW = max(Int(Float(srcW) * scale), 320)
         let workH = max(Int(Float(srcH) * scale), 320)

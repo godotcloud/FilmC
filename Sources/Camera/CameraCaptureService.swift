@@ -4,8 +4,9 @@
 //
 //  Hardware-Aligned Capture Engine for iPhone 13 Pro Max (iPhone14,3 / A15 Bionic)
 //  - Unified Continuous Session (Zero `AVCaptureSession` teardown when switching between 12MP Photo & Video modes!)
+//  - Configurable Video Resolution (720p / 1080p / 4K), Frame Rate (24 / 30 / 60 fps), & Codec (HEVC / H.264 / ProRes 422)
+//  - Dynamic Portrait & Landscape Orientation Support (`AVCaptureVideoOrientation` + Recording Dimensions)
 //  - Non-Blocking Lock-Protected Video Recording State Machine (Zero `videoWriterQueue.sync` on Main Thread!)
-//  - GPU-Completion-Synchronized `AVAssetWriterInputPixelBufferAdaptor` Append
 //  - Hardware Focus Control: Continuous AutoFocus (AF-C), Tap-to-Focus & Exposure Point of Interest,
 //    and Voice-Coil Motor Manual Focus (`setFocusModeLocked(lensPosition:)` 0.00 Macro to 1.00 Infinity)
 //
@@ -18,6 +19,7 @@ import CoreImage
 import Photos
 import Metal
 import Combine
+import UIKit
 
 public enum iPhone13ProMaxLens: String, CaseIterable, Identifiable, Equatable {
     case ultraWide13mm = "builtInUltraWideCamera"
@@ -61,11 +63,70 @@ public enum VideoRecordingPipelineMode: Int, CaseIterable, Identifiable, Equatab
     }
 }
 
-public enum VideoCodecSelection: String, CaseIterable, Identifiable, Equatable {
-    case hevc10Bit   = "HEVC 10-bit"
-    case proRes422HQ = "Apple ProRes 422 HQ"
+public enum VideoResolutionPreset: String, CaseIterable, Identifiable, Equatable {
+    case hd720p  = "720p"
+    case fhd1080 = "1080p"
+    case uhd4k   = "4K"
 
     public var id: String { rawValue }
+
+    /// 4:3 sensor-matched short & long edges (keeps 100% sensor FoV with zero crop/stretch)
+    public var shortEdge: Int {
+        switch self {
+        case .hd720p:  return 720
+        case .fhd1080: return 1080
+        case .uhd4k:   return 2160
+        }
+    }
+
+    public var longEdge: Int {
+        switch self {
+        case .hd720p:  return 960
+        case .fhd1080: return 1440
+        case .uhd4k:   return 2880
+        }
+    }
+
+    public var metalWorkLongEdge: Int {
+        switch self {
+        case .hd720p:  return 960
+        case .fhd1080: return 1440
+        case .uhd4k:   return 2160
+        }
+    }
+
+    public var targetBitRate: Int {
+        switch self {
+        case .hd720p:  return 16_000_000
+        case .fhd1080: return 30_000_000
+        case .uhd4k:   return 65_000_000
+        }
+    }
+}
+
+public enum VideoFrameRateOption: Int, CaseIterable, Identifiable, Equatable {
+    case fps24 = 24
+    case fps30 = 30
+    case fps60 = 60
+
+    public var id: Int { rawValue }
+    public var label: String { "\(rawValue)fps" }
+}
+
+public enum VideoCodecSelection: String, CaseIterable, Identifiable, Equatable {
+    case hevc      = "HEVC (H.265)"
+    case h264      = "H.264"
+    case proRes422 = "ProRes 422"
+
+    public var id: String { rawValue }
+
+    public var avCodecType: AVVideoCodecType {
+        switch self {
+        case .hevc:      return .hevc
+        case .h264:      return .h264
+        case .proRes422: return .proRes422
+        }
+    }
 }
 
 public final class CameraCaptureService: NSObject, ObservableObject {
@@ -78,7 +139,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
                     stopVideoRecording()
                 }
                 statusBannerText = isCaptureModeVideo
-                    ? "Physical Film & Log Video Ready"
+                    ? "Video Ready (\(videoResolution.rawValue) · \(videoFrameRate.label) · \(videoCodec.rawValue))"
                     : "12MP (3024×4032) Spectral Darkroom Ready"
                 bumpParameterRevision()
             }
@@ -92,7 +153,29 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             bumpParameterRevision()
         }
     }
-    @Published public var videoCodec: VideoCodecSelection = .hevc10Bit
+    @Published public var videoResolution: VideoResolutionPreset = .fhd1080 {
+        didSet {
+            if isCaptureModeVideo && !isRecordingVideo {
+                statusBannerText = "Video: \(videoResolution.rawValue) · \(videoFrameRate.label) · \(videoCodec.rawValue)"
+            }
+        }
+    }
+    @Published public var videoFrameRate: VideoFrameRateOption = .fps30 {
+        didSet {
+            applyHardwareFrameRate(videoFrameRate)
+            if isCaptureModeVideo && !isRecordingVideo {
+                statusBannerText = "Video: \(videoResolution.rawValue) · \(videoFrameRate.label) · \(videoCodec.rawValue)"
+            }
+        }
+    }
+    @Published public var videoCodec: VideoCodecSelection = .hevc {
+        didSet {
+            if isCaptureModeVideo && !isRecordingVideo {
+                statusBannerText = "Video: \(videoResolution.rawValue) · \(videoFrameRate.label) · \(videoCodec.rawValue)"
+            }
+        }
+    }
+    @Published public var currentVideoOrientation: AVCaptureVideoOrientation = .portrait
     @Published public var statusBannerText: String = "12MP (3024×4032) Spectral Darkroom Ready"
     @Published public var activePixelFormatIs10Bit: Bool = false
 
@@ -208,7 +291,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
     }
 
     // Unified camera session that serves both 12MP Photo Capture and Real-Time Video Recording
-    // without tearing down inputs/outputs or triggering `AVCaptureSession` format exceptions!
     private func configureSession(for lens: iPhone13ProMaxLens) {
         session.beginConfiguration()
 
@@ -265,7 +347,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             if cameraDevice.isSmoothAutoFocusSupported {
                 cameraDevice.isSmoothAutoFocusEnabled = true
             }
-            if cameraDevice.isSubjectAreaChangeMonitoringEnabled != true {
+            if !cameraDevice.isSubjectAreaChangeMonitoringEnabled {
                 cameraDevice.isSubjectAreaChangeMonitoringEnabled = true
             }
             if cameraDevice.isExposurePointOfInterestSupported {
@@ -294,32 +376,95 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             kCVPixelBufferPixelFormatTypeKey as String: targetFormat
         ]
 
+        let targetOrientation = self.currentVideoOrientation
         if let connection = videoDataOutput.connection(with: .video) {
             if connection.isVideoOrientationSupported {
-                connection.videoOrientation = .portrait
+                connection.videoOrientation = targetOrientation
             }
             connection.isEnabled = true
         }
 
         if let photoConn = photoOutput.connection(with: .video),
            photoConn.isVideoOrientationSupported {
-            photoConn.videoOrientation = .portrait
+            photoConn.videoOrientation = targetOrientation
         }
 
         session.commitConfiguration()
         isSessionConfigured = true
+
+        applyHardwareFrameRate(self.videoFrameRate)
 
         if !session.isRunning {
             session.startRunning()
         }
 
         let isVideo = self.isCaptureModeVideo
+        let resLabel = self.videoResolution.rawValue
+        let fpsLabel = self.videoFrameRate.label
+        let codecLabel = self.videoCodec.rawValue
         DispatchQueue.main.async {
             self.isManualFocusMode = false
             self.activePixelFormatIs10Bit = false
             self.statusBannerText = isVideo
-                ? "Physical Film & Log Video Ready"
+                ? "Video Ready (\(resLabel) · \(fpsLabel) · \(codecLabel))"
                 : "12MP (3024×4032) Spectral Darkroom Ready"
+        }
+    }
+
+    // MARK: - Orientation & Hardware Frame Rate Controls
+    public func updateInterfaceOrientation(_ orientation: UIInterfaceOrientation) {
+        let avOrient: AVCaptureVideoOrientation
+        switch orientation {
+        case .landscapeLeft:      avOrient = .landscapeLeft
+        case .landscapeRight:     avOrient = .landscapeRight
+        case .portraitUpsideDown: avOrient = .portraitUpsideDown
+        default:                  avOrient = .portrait
+        }
+        guard avOrient != currentVideoOrientation else { return }
+        DispatchQueue.main.async {
+            self.currentVideoOrientation = avOrient
+        }
+        sessionQueue.async { [weak self] in
+            guard let self = self, self.isSessionConfigured else { return }
+            if let vConn = self.videoDataOutput.connection(with: .video),
+               vConn.isVideoOrientationSupported {
+                vConn.videoOrientation = avOrient
+            }
+            if let pConn = self.photoOutput.connection(with: .video),
+               pConn.isVideoOrientationSupported {
+                pConn.videoOrientation = avOrient
+            }
+            self.bumpParameterRevision()
+        }
+    }
+
+    private func applyHardwareFrameRate(_ fpsOption: VideoFrameRateOption) {
+        sessionQueue.async { [weak self] in
+            guard let self = self,
+                  let device = self.videoDeviceInput?.device else { return }
+            let desiredFPS = Double(fpsOption.rawValue)
+            let ranges = device.activeFormat.videoSupportedFrameRateRanges
+            guard !ranges.isEmpty else { return }
+
+            var bestFPS = desiredFPS
+            var supported = false
+            for range in ranges {
+                if desiredFPS >= range.minFrameRate && desiredFPS <= range.maxFrameRate {
+                    supported = true
+                    break
+                }
+            }
+            if !supported, let first = ranges.first {
+                bestFPS = min(max(desiredFPS, first.minFrameRate), first.maxFrameRate)
+            }
+
+            let duration = CMTimeMake(value: 1, timescale: Int32(max(1, Int(bestFPS.rounded()))))
+            do {
+                try device.lockForConfiguration()
+                device.activeVideoMinFrameDuration = duration
+                device.activeVideoMaxFrameDuration = duration
+                device.unlockForConfiguration()
+            } catch {}
         }
     }
 
@@ -338,7 +483,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
     }
 
     // MARK: - Hardware Focus & Exposure Point-of-Interest Control
-    /// Converts a tap point in portrait normalized sensor coordinates `(0...1, 0...1)` to hardware AF + AE lock/track
     public func focusAndExpose(at devicePoint: CGPoint) {
         let clampedPoint = CGPoint(
             x: max(0.02, min(0.98, devicePoint.x)),
@@ -374,7 +518,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         }
     }
 
-    /// Locks the iPhone 13 Pro Max voice-coil actuator at a specific normalized distance (`0.0` Macro -> `1.0` Infinity)
     public func setManualFocusLensPosition(_ position: Float) {
         let clamped = max(0.0, min(1.0, position))
         DispatchQueue.main.async {
@@ -396,7 +539,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         }
     }
 
-    /// Restores continuous phase-detection autofocus (`AF-C`) across the center of the frame
     public func resetToContinuousAutoFocus() {
         DispatchQueue.main.async {
             self.isManualFocusMode = false
@@ -433,7 +575,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         guard !isProcessing12MPPhoto else { return }
         DispatchQueue.main.async {
             self.isProcessing12MPPhoto = true
-            self.statusBannerText = "Developing 12MP (3024×4032) Spectral Print..."
+            self.statusBannerText = "Developing 12MP Spectral Print..."
         }
 
         sessionQueue.async { [weak self] in
@@ -458,14 +600,13 @@ public final class CameraCaptureService: NSObject, ObservableObject {
 
             if let photoConn = self.photoOutput.connection(with: .video),
                photoConn.isVideoOrientationSupported {
-                photoConn.videoOrientation = .portrait
+                photoConn.videoOrientation = self.currentVideoOrientation
             }
 
             self.photoOutput.capturePhoto(with: photoSettings, delegate: self)
         }
     }
 
-    // MARK: - Develop Full 12MP (3024x4032) Sensor Image Through 81-Band Metal Darkroom
     private func processAndSaveFullResolutionPhoto(photoData: Data, paramsSnapshot: FilmSimulationParameters) {
         photoRenderQueue.async { [weak self] in
             guard let self = self,
@@ -563,7 +704,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Crash-Proof Real-Time Video Recording (`AVAssetWriter` + `AVAssetWriterInputPixelBufferAdaptor`)
+    // MARK: - High-Resolution Configurable Real-Time Video Recording
     public func toggleVideoRecording() {
         if isRecordingVideo {
             stopVideoRecording()
@@ -575,6 +716,13 @@ public final class CameraCaptureService: NSObject, ObservableObject {
     private func startVideoRecording() {
         let modeSnapshot = self.videoPipelineMode
         let logSnapshot = self.logTransferCurve
+        let resSnapshot = self.videoResolution
+        let fpsSnapshot = self.videoFrameRate
+        let codecSnapshot = self.videoCodec
+        let isLandscape = (self.currentVideoOrientation == .landscapeLeft || self.currentVideoOrientation == .landscapeRight)
+
+        let recWidth = isLandscape ? resSnapshot.longEdge : resSnapshot.shortEdge
+        let recHeight = isLandscape ? resSnapshot.shortEdge : resSnapshot.longEdge
 
         videoWriterQueue.async { [weak self] in
             guard let self = self else { return }
@@ -590,17 +738,18 @@ public final class CameraCaptureService: NSObject, ObservableObject {
 
             do {
                 let writer = try AVAssetWriter(outputURL: tempURL, fileType: .mov)
-                // 3:4 aspect ratio (720x960) matches the sensor & viewfinder aspect ratio without cropping
-                let recWidth = 720
-                let recHeight = 960
-                let videoSettings: [String: Any] = [
-                    AVVideoCodecKey: AVVideoCodecType.hevc,
+
+                var videoSettings: [String: Any] = [
+                    AVVideoCodecKey: codecSnapshot.avCodecType,
                     AVVideoWidthKey: recWidth,
-                    AVVideoHeightKey: recHeight,
-                    AVVideoCompressionPropertiesKey: [
-                        AVVideoAverageBitRateKey: 14_000_000
-                    ]
+                    AVVideoHeightKey: recHeight
                 ]
+                if codecSnapshot != .proRes422 {
+                    videoSettings[AVVideoCompressionPropertiesKey] = [
+                        AVVideoAverageBitRateKey: resSnapshot.targetBitRate,
+                        AVVideoExpectedSourceFrameRateKey: fpsSnapshot.rawValue
+                    ]
+                }
 
                 let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
                 writerInput.expectsMediaDataInRealTime = true
@@ -628,8 +777,6 @@ public final class CameraCaptureService: NSObject, ObservableObject {
                     return
                 }
 
-                // Immediately start session at kCMTimeZero and use relative presentation timestamps
-                // so `startSession(atSourceTime:)` is ALWAYS active before any frame or `stopVideoRecording()`!
                 writer.startSession(atSourceTime: .zero)
 
                 self.assetWriter = writer
@@ -643,9 +790,10 @@ public final class CameraCaptureService: NSObject, ObservableObject {
 
                 DispatchQueue.main.async {
                     self.isRecordingVideo = true
+                    let spec = "\(recWidth)×\(recHeight) \(fpsSnapshot.label) \(codecSnapshot.rawValue)"
                     self.statusBannerText = (modeSnapshot == .logCleanWithFilmMonitor)
-                        ? "REC \(logSnapshot.displayName) + Live Film VF"
-                        : "REC Baked Physical Film"
+                        ? "REC \(logSnapshot.displayName) · \(spec)"
+                        : "REC Film · \(spec)"
                 }
             } catch {
                 self.writerLock.unlock()
@@ -657,18 +805,17 @@ public final class CameraCaptureService: NSObject, ObservableObject {
         }
     }
 
-    // Non-blocking lock check (never blocks main thread on `videoWriterQueue.sync`!)
     public func dequeueVideoRecordingBufferIfNeeded(cameraFrameID: UInt64) -> (pixelBuffer: CVPixelBuffer, bakeFilm: Bool)? {
         guard writerLock.try() else { return nil }
         defer { writerLock.unlock() }
 
         guard isWriterActive,
-               cameraFrameID != lastDequeuedCameraFrameID,
-               let writer = assetWriter,
-               writer.status == .writing,
-               let input = assetWriterVideoInput,
-               input.isReadyForMoreMediaData,
-               let pool = assetWriterPixelBufferAdaptor?.pixelBufferPool else {
+              cameraFrameID != lastDequeuedCameraFrameID,
+              let writer = assetWriter,
+              writer.status == .writing,
+              let input = assetWriterVideoInput,
+              input.isReadyForMoreMediaData,
+              let pool = assetWriterPixelBufferAdaptor?.pixelBufferPool else {
             return nil
         }
 
@@ -752,7 +899,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
                         DispatchQueue.main.async {
                             self?.isRecordingVideo = false
                             self?.statusBannerText = saved
-                                ? "Saved Physical Film/Log Video to Photos"
+                                ? "Saved High-Res Film/Log Video to Photos"
                                 : "Video Saved"
                         }
                     }
@@ -762,7 +909,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
                 try? FileManager.default.removeItem(at: outputURL)
                 DispatchQueue.main.async {
                     self.isRecordingVideo = false
-                    self.statusBannerText = "Physical Film & Log Video Ready"
+                    self.statusBannerText = "Video Ready"
                 }
             }
         }

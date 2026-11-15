@@ -3,17 +3,18 @@
 //  SpektraCam
 //
 //  Native Darkroom UI & ProMotion MetalKit Viewfinder for iPhone 13 Pro Max (6.7" 428x926 pt)
-//  - GeometryReader-Driven Explicit Viewfinder Sizing (`availableWidth x (availableWidth * 4/3)` capped to fit):
-//    Guarantees the 3:4 viewfinder ALWAYS fills 100% of the screen width cleanly without SwiftUI
-//    `aspectRatio(.fit)` shrinking it horizontally into a tiny centered square!
+//  - Responsive Portrait & Landscape Cinema Layout (`GeometryReader` adaptive `VStack` vs side-by-side `HStack`)
+//  - High-Resolution Video Controls: Resolution (720p / 1080p / 4K), Frame Rate (24 / 30 / 60 fps), Codec (HEVC / H.264 / ProRes 422)
 //  - Interactive Tap-to-Focus & Exposure Reticle + Hardware Voice-Coil Manual Focus (0.00 Macro to 1.00 Infinity)
-//  - Hong Kong Cinema Master Darkroom Recipes (Wong Kar-wai / Christopher Doyle & Johnnie To / Cheng Siu-keung)
+//  - Hong Kong Cinema Master Darkroom Recipes (Wong Kar-wai & Johnnie To)
 //
 
 import SwiftUI
 import MetalKit
 import CoreVideo
 import CoreMedia
+import AVFoundation
+import UIKit
 
 public struct MetalFilmViewfinder: UIViewRepresentable {
     public let cameraService: CameraCaptureService
@@ -79,6 +80,7 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
             let recTarget = cameraService.isRecordingVideo
                 ? cameraService.dequeueVideoRecordingBufferIfNeeded(cameraFrameID: snapshot.frameID)
                 : nil
+            let workEdge = (recTarget != nil) ? cameraService.videoResolution.metalWorkLongEdge : 840
 
             let framePTS = snapshot.pts
             let serviceRef = self.cameraService
@@ -90,6 +92,7 @@ public struct MetalFilmViewfinder: UIViewRepresentable {
                 drawable: drawable,
                 recordingPixelBuffer: recTarget?.pixelBuffer,
                 recordBakedFilm: recTarget?.bakeFilm ?? true,
+                maxWorkLongEdge: workEdge,
                 onRecordingFrameCompleted: recTarget.map { validRec in
                     return {
                         serviceRef.appendRecordedVideoFrame(validRec.pixelBuffer, pts: framePTS)
@@ -239,186 +242,31 @@ public struct SpektraCamMainView: View {
     public init() {}
 
     public var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
+        GeometryReader { rootGeo in
+            let isLandscape = rootGeo.size.width > rootGeo.size.height
 
-            VStack(spacing: 5) {
-                topTelemetryHeader
+            ZStack {
+                Color.black.ignoresSafeArea()
 
-                // Explicit GeometryReader guarantees full-width 3:4 viewfinder framing without horizontal collapse
-                GeometryReader { geo in
-                    let vfWidth = geo.size.width
-                    let vfHeight = max(min(geo.size.height, vfWidth * (4.0 / 3.0)), 120.0)
-
-                    ZStack(alignment: .bottom) {
-                        ZStack(alignment: .topLeading) {
-                            MetalFilmViewfinder(cameraService: cameraService)
-                                .frame(width: vfWidth, height: vfHeight)
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 12)
-                                        .stroke(cameraService.isRecordingVideo ? Color.red : Color.orange.opacity(0.45), lineWidth: cameraService.isRecordingVideo ? 2 : 1)
-                                )
-                                .contentShape(Rectangle())
-                                .gesture(
-                                    DragGesture(minimumDistance: 0)
-                                        .onEnded { value in
-                                            let loc = value.location
-                                            let clampedX = max(24.0, min(vfWidth - 24.0, loc.x))
-                                            let clampedY = max(24.0, min(vfHeight - 24.0, loc.y))
-                                            focusReticlePoint = CGPoint(x: clampedX, y: clampedY)
-                                            withAnimation(.spring(response: 0.22, dampingFraction: 0.68)) {
-                                                showFocusReticle = true
-                                            }
-                                            // Portrait back-camera sensor coordinates: x = y_view / H, y = 1.0 - (x_view / W)
-                                            let devicePt = CGPoint(
-                                                x: clampedY / vfHeight,
-                                                y: 1.0 - (clampedX / vfWidth)
-                                            )
-                                            cameraService.focusAndExpose(at: devicePt)
-                                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
-                                                withAnimation(.easeOut(duration: 0.25)) {
-                                                    showFocusReticle = false
-                                                }
-                                            }
-                                        }
-                                )
-
-                            if showFocusReticle, let pt = focusReticlePoint {
-                                ZStack {
-                                    RoundedRectangle(cornerRadius: 4)
-                                        .stroke(Color.yellow, lineWidth: 1.8)
-                                        .frame(width: 58, height: 58)
-                                    Circle()
-                                        .fill(Color.yellow)
-                                        .frame(width: 5, height: 5)
-                                }
-                                .position(x: pt.x, y: pt.y)
-                            }
-                        }
-
-                        VStack(spacing: 5) {
-                            // Live Manual Focus Distance Slider Overlay when MF mode is engaged
-                            if cameraService.isManualFocusMode {
-                                HStack(spacing: 6) {
-                                    Text("MF")
-                                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                        .foregroundColor(.yellow)
-                                    Text("Macro")
-                                        .font(.system(size: 9, design: .monospaced))
-                                        .foregroundColor(.gray)
-                                    Slider(
-                                        value: Binding(
-                                            get: { cameraService.manualFocusLensPosition },
-                                            set: { newVal in cameraService.setManualFocusLensPosition(newVal) }
-                                        ),
-                                        in: 0.0...1.0
-                                    )
-                                    .tint(.yellow)
-                                    Text("∞")
-                                        .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                        .foregroundColor(.gray)
-                                    Text(String(format: "%.2f", cameraService.manualFocusLensPosition))
-                                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                        .foregroundColor(.yellow)
-                                        .frame(width: 32, alignment: .trailing)
-                                }
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 4)
-                                .background(Color.black.opacity(0.75))
-                                .cornerRadius(10)
-                                .padding(.horizontal, 8)
-                            }
-
-                            HStack(spacing: 5) {
-                                lensSelectorPill
-                                Spacer(minLength: 2)
-
-                                // Hardware AF-C / Manual Focus Toggle Pill
-                                Button {
-                                    if cameraService.isManualFocusMode {
-                                        cameraService.resetToContinuousAutoFocus()
-                                    } else {
-                                        cameraService.setManualFocusLensPosition(cameraService.manualFocusLensPosition)
-                                    }
-                                } label: {
-                                    Text(cameraService.isManualFocusMode ? String(format: "MF %.2f", cameraService.manualFocusLensPosition) : "AF-C")
-                                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                        .foregroundColor(cameraService.isManualFocusMode ? .black : .yellow)
-                                        .lineLimit(1)
-                                        .padding(.horizontal, 7)
-                                        .padding(.vertical, 5)
-                                        .background(cameraService.isManualFocusMode ? Color.yellow : Color.black.opacity(0.68))
-                                        .cornerRadius(12)
-                                }
-                                .buttonStyle(.plain)
-
-                                Button {
-                                    let currentNeg = params.negativeStockID
-                                    let currentPrt = params.printStockID
-                                    var fresh = FilmSimulationParameters()
-                                    fresh.negativeStockID = currentNeg
-                                    fresh.printStockID = currentPrt
-                                    fresh.lensFocalLengthMM = cameraService.activeLens.nominalFocalMM
-                                    activeRecipeID = "standard_lab_neutral"
-                                    params = fresh
-                                    cameraService.activeParameters = fresh
-                                    cameraService.resetToContinuousAutoFocus()
-                                } label: {
-                                    Text("RESET")
-                                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                        .foregroundColor(.white)
-                                        .lineLimit(1)
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 5)
-                                        .background(Color.black.opacity(0.68))
-                                        .cornerRadius(12)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.bottom, 8)
-                        }
-                    }
-                    .frame(width: geo.size.width, height: geo.size.height, alignment: .center)
+                if isLandscape {
+                    landscapeBody(totalSize: rootGeo.size)
+                } else {
+                    portraitBody
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .layoutPriority(1)
-
-                FilmStockCarouselStrip(
-                    selectedNegID: $params.negativeStockID,
-                    selectedPrintID: $params.printStockID,
-                    activeRecipeID: $activeRecipeID,
-                    onSelectRecipe: { recipe in
-                        isApplyingRecipe = true
-                        activeRecipeID = recipe.id
-                        var updated = params
-                        updated.applyHKCinemaRecipe(recipe)
-                        updated.lensFocalLengthMM = cameraService.activeLens.nominalFocalMM
-                        params = updated
-                        cameraService.activeParameters = updated
-                        cameraService.statusBannerText = "HK Cinema: \(recipe.title) (\(recipe.stockSummary))"
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            isApplyingRecipe = false
-                        }
-                    }
-                )
-
-                if showDarkroomDrawer {
-                    darkroomParameterDrawer
-                }
-
-                bottomShutterDeck
             }
-            .padding(.horizontal, 10)
-            .padding(.top, 2)
-            .padding(.bottom, 4)
+            .onChange(of: isLandscape) { _ in
+                syncInterfaceOrientation()
+            }
         }
         .preferredColorScheme(.dark)
         .dynamicTypeSize(.medium)
         .onAppear {
             cameraService.activeParameters = params
             cameraService.requestPermissionsAndSetup()
+            syncInterfaceOrientation()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
+            syncInterfaceOrientation()
         }
         .onChange(of: params.negativeStockID) { newNegID in
             guard !isApplyingRecipe else { return }
@@ -442,6 +290,233 @@ public struct SpektraCamMainView: View {
         }
     }
 
+    private func syncInterfaceOrientation() {
+        let scenes = UIApplication.shared.connectedScenes
+        if let windowScene = scenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene
+            ?? (scenes.first as? UIWindowScene) {
+            cameraService.updateInterfaceOrientation(windowScene.interfaceOrientation)
+        }
+    }
+
+    // MARK: - Portrait Layout (Classic Vertical Darkroom)
+    private var portraitBody: some View {
+        VStack(spacing: 5) {
+            topTelemetryHeader
+
+            GeometryReader { geo in
+                let vfWidth = geo.size.width
+                let vfHeight = max(min(geo.size.height, vfWidth * (4.0 / 3.0)), 120.0)
+                viewfinderContainer(vfWidth: vfWidth, vfHeight: vfHeight, isLandscape: false)
+                    .frame(width: geo.size.width, height: geo.size.height, alignment: .center)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .layoutPriority(1)
+
+            stockCarouselView
+
+            if showDarkroomDrawer {
+                darkroomParameterDrawer(height: 136)
+            }
+
+            bottomShutterDeck(compact: false)
+        }
+        .padding(.horizontal, 10)
+        .padding(.top, 2)
+        .padding(.bottom, 4)
+    }
+
+    // MARK: - Landscape Cinema Layout (Side-by-Side 4:3 Viewfinder + Right Control Deck)
+    private func landscapeBody(totalSize: CGSize) -> some View {
+        let rightPanelWidth = min(max(totalSize.width * 0.40, 270), 340)
+
+        return HStack(spacing: 8) {
+            GeometryReader { geo in
+                let vfHeight = geo.size.height
+                let vfWidth = max(min(geo.size.width, vfHeight * (4.0 / 3.0)), 160.0)
+                viewfinderContainer(vfWidth: vfWidth, vfHeight: vfHeight, isLandscape: true)
+                    .frame(width: geo.size.width, height: geo.size.height, alignment: .center)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .layoutPriority(1)
+
+            VStack(spacing: 5) {
+                topTelemetryHeader
+                stockCarouselView
+
+                if showDarkroomDrawer {
+                    darkroomParameterDrawer(height: max(84, totalSize.height - 235))
+                } else {
+                    Spacer(minLength: 0)
+                }
+
+                bottomShutterDeck(compact: true)
+            }
+            .frame(width: rightPanelWidth)
+            .frame(maxHeight: .infinity)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+    }
+
+    private var stockCarouselView: some View {
+        FilmStockCarouselStrip(
+            selectedNegID: $params.negativeStockID,
+            selectedPrintID: $params.printStockID,
+            activeRecipeID: $activeRecipeID,
+            onSelectRecipe: { recipe in
+                isApplyingRecipe = true
+                activeRecipeID = recipe.id
+                var updated = params
+                updated.applyHKCinemaRecipe(recipe)
+                updated.lensFocalLengthMM = cameraService.activeLens.nominalFocalMM
+                params = updated
+                cameraService.activeParameters = updated
+                cameraService.statusBannerText = "HK Cinema: \(recipe.title) (\(recipe.stockSummary))"
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    isApplyingRecipe = false
+                }
+            }
+        )
+    }
+
+    private func viewfinderContainer(vfWidth: CGFloat, vfHeight: CGFloat, isLandscape: Bool) -> some View {
+        ZStack(alignment: .bottom) {
+            ZStack(alignment: .topLeading) {
+                MetalFilmViewfinder(cameraService: cameraService)
+                    .frame(width: vfWidth, height: vfHeight)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(cameraService.isRecordingVideo ? Color.red : Color.orange.opacity(0.45), lineWidth: cameraService.isRecordingVideo ? 2 : 1)
+                    )
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onEnded { value in
+                                let loc = value.location
+                                let clampedX = max(24.0, min(vfWidth - 24.0, loc.x))
+                                let clampedY = max(24.0, min(vfHeight - 24.0, loc.y))
+                                focusReticlePoint = CGPoint(x: clampedX, y: clampedY)
+                                withAnimation(.spring(response: 0.22, dampingFraction: 0.68)) {
+                                    showFocusReticle = true
+                                }
+                                let nx = clampedX / max(vfWidth, 1.0)
+                                let ny = clampedY / max(vfHeight, 1.0)
+                                let devicePt: CGPoint
+                                switch cameraService.currentVideoOrientation {
+                                case .landscapeRight:
+                                    devicePt = CGPoint(x: 1.0 - nx, y: 1.0 - ny)
+                                case .landscapeLeft:
+                                    devicePt = CGPoint(x: nx, y: ny)
+                                default:
+                                    devicePt = CGPoint(x: ny, y: 1.0 - nx)
+                                }
+                                cameraService.focusAndExpose(at: devicePt)
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+                                    withAnimation(.easeOut(duration: 0.25)) {
+                                        showFocusReticle = false
+                                    }
+                                }
+                            }
+                    )
+
+                if showFocusReticle, let pt = focusReticlePoint {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 4)
+                            .stroke(Color.yellow, lineWidth: 1.8)
+                            .frame(width: 58, height: 58)
+                        Circle()
+                            .fill(Color.yellow)
+                            .frame(width: 5, height: 5)
+                    }
+                    .position(x: pt.x, y: pt.y)
+                }
+            }
+
+            VStack(spacing: 5) {
+                if cameraService.isManualFocusMode {
+                    HStack(spacing: 6) {
+                        Text("MF")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .foregroundColor(.yellow)
+                        Text("Macro")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundColor(.gray)
+                        Slider(
+                            value: Binding(
+                                get: { cameraService.manualFocusLensPosition },
+                                set: { newVal in cameraService.setManualFocusLensPosition(newVal) }
+                            ),
+                            in: 0.0...1.0
+                        )
+                        .tint(.yellow)
+                        Text("∞")
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundColor(.gray)
+                        Text(String(format: "%.2f", cameraService.manualFocusLensPosition))
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .foregroundColor(.yellow)
+                            .frame(width: 32, alignment: .trailing)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(Color.black.opacity(0.75))
+                    .cornerRadius(10)
+                    .padding(.horizontal, 8)
+                }
+
+                HStack(spacing: 5) {
+                    lensSelectorPill
+                    Spacer(minLength: 2)
+
+                    Button {
+                        if cameraService.isManualFocusMode {
+                            cameraService.resetToContinuousAutoFocus()
+                        } else {
+                            cameraService.setManualFocusLensPosition(cameraService.manualFocusLensPosition)
+                        }
+                    } label: {
+                        Text(cameraService.isManualFocusMode ? String(format: "MF %.2f", cameraService.manualFocusLensPosition) : "AF-C")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .foregroundColor(cameraService.isManualFocusMode ? .black : .yellow)
+                            .lineLimit(1)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 5)
+                            .background(cameraService.isManualFocusMode ? Color.yellow : Color.black.opacity(0.68))
+                            .cornerRadius(12)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        let currentNeg = params.negativeStockID
+                        let currentPrt = params.printStockID
+                        var fresh = FilmSimulationParameters()
+                        fresh.negativeStockID = currentNeg
+                        fresh.printStockID = currentPrt
+                        fresh.lensFocalLengthMM = cameraService.activeLens.nominalFocalMM
+                        activeRecipeID = "standard_lab_neutral"
+                        params = fresh
+                        cameraService.activeParameters = fresh
+                        cameraService.resetToContinuousAutoFocus()
+                    } label: {
+                        Text("RESET")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(Color.black.opacity(0.68))
+                            .cornerRadius(12)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 8)
+                .padding(.bottom, 8)
+            }
+        }
+        .frame(width: vfWidth, height: vfHeight)
+    }
+
     private var topTelemetryHeader: some View {
         let neg = FilmStockDatabase.cameraStock(withID: params.negativeStockID)
         let prt = FilmStockDatabase.printStock(withID: params.printStockID)
@@ -451,12 +526,12 @@ public struct SpektraCamMainView: View {
                     .font(.system(size: 12, weight: .bold, design: .monospaced))
                     .foregroundColor(.orange)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.8)
+                    .minimumScaleFactor(0.75)
                 Text(cameraService.statusBannerText)
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .foregroundColor(cameraService.isProcessing12MPPhoto ? .yellow : (cameraService.isRecordingVideo ? .red : .gray))
                     .lineLimit(1)
-                    .minimumScaleFactor(0.8)
+                    .minimumScaleFactor(0.75)
             }
             Spacer()
             Text(params.filmFormatGate.displayName.components(separatedBy: " ").first ?? "35mm")
@@ -490,7 +565,7 @@ public struct SpektraCamMainView: View {
         }
     }
 
-    private var darkroomParameterDrawer: some View {
+    private func darkroomParameterDrawer(height: CGFloat) -> some View {
         VStack(spacing: 4) {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
@@ -635,7 +710,7 @@ public struct SpektraCamMainView: View {
                 }
                 .padding(8)
             }
-            .frame(height: 140)
+            .frame(height: height)
             .background(Color(white: 0.09))
             .cornerRadius(10)
         }
@@ -659,27 +734,60 @@ public struct SpektraCamMainView: View {
         }
     }
 
-    private var bottomShutterDeck: some View {
-        VStack(spacing: 6) {
+    private func bottomShutterDeck(compact: Bool) -> some View {
+        VStack(spacing: 5) {
             if cameraService.isCaptureModeVideo {
-                HStack(spacing: 8) {
-                    Picker("Video Mode", selection: $cameraService.videoPipelineMode) {
-                        ForEach(VideoRecordingPipelineMode.allCases) { mode in
-                            Text(mode.title).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
+                VStack(spacing: 4) {
+                    // Resolution (720p / 1080p / 4K), FPS (24 / 30 / 60), Codec (HEVC / H.264 / ProRes 422)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            Picker("Resolution", selection: $cameraService.videoResolution) {
+                                ForEach(VideoResolutionPreset.allCases) { res in
+                                    Text(res.rawValue).tag(res)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .disabled(cameraService.isRecordingVideo)
 
-                    Picker("Log Curve", selection: $cameraService.logTransferCurve) {
-                        ForEach(LogEncodingTransferFunction.allCases) { curve in
-                            Text(curve.displayName).tag(curve)
+                            Picker("FPS", selection: $cameraService.videoFrameRate) {
+                                ForEach(VideoFrameRateOption.allCases) { fps in
+                                    Text(fps.label).tag(fps)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .disabled(cameraService.isRecordingVideo)
+
+                            Picker("Codec", selection: $cameraService.videoCodec) {
+                                ForEach(VideoCodecSelection.allCases) { codec in
+                                    Text(codec.rawValue).tag(codec)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .disabled(cameraService.isRecordingVideo)
                         }
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
                     }
-                    .pickerStyle(.menu)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                    HStack(spacing: 6) {
+                        Picker("Video Mode", selection: $cameraService.videoPipelineMode) {
+                            ForEach(VideoRecordingPipelineMode.allCases) { mode in
+                                Text(mode.title).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+
+                        Picker("Log Curve", selection: $cameraService.logTransferCurve) {
+                            ForEach(LogEncodingTransferFunction.allCases) { curve in
+                                Text(curve.displayName).tag(curve)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    }
                 }
             }
 
-            HStack(spacing: 24) {
+            HStack(spacing: compact ? 12 : 24) {
                 Button {
                     cameraService.isCaptureModeVideo.toggle()
                 } label: {
@@ -687,7 +795,7 @@ public struct SpektraCamMainView: View {
                         .font(.system(size: 11, weight: .bold, design: .monospaced))
                         .foregroundColor(.black)
                         .lineLimit(1)
-                        .padding(.horizontal, 12)
+                        .padding(.horizontal, compact ? 9 : 12)
                         .padding(.vertical, 8)
                         .background(cameraService.isCaptureModeVideo ? Color.red : Color.orange)
                         .cornerRadius(8)
@@ -704,11 +812,11 @@ public struct SpektraCamMainView: View {
                     ZStack {
                         Circle()
                             .stroke(Color.white, lineWidth: 3)
-                            .frame(width: 60, height: 60)
+                            .frame(width: compact ? 50 : 60, height: compact ? 50 : 60)
                         Circle()
                             .fill(cameraService.isCaptureModeVideo ? Color.red : Color.orange)
-                            .frame(width: cameraService.isRecordingVideo ? 28 : 48,
-                                   height: cameraService.isRecordingVideo ? 28 : 48)
+                            .frame(width: cameraService.isRecordingVideo ? (compact ? 22 : 28) : (compact ? 38 : 48),
+                                   height: cameraService.isRecordingVideo ? (compact ? 22 : 28) : (compact ? 38 : 48))
                             .opacity(cameraService.isProcessing12MPPhoto ? 0.65 : 1.0)
                             .animation(.easeInOut(duration: 0.15), value: cameraService.isRecordingVideo)
                     }
@@ -722,7 +830,7 @@ public struct SpektraCamMainView: View {
                         .font(.system(size: 11, weight: .bold, design: .monospaced))
                         .foregroundColor(.white)
                         .lineLimit(1)
-                        .padding(.horizontal, 12)
+                        .padding(.horizontal, compact ? 9 : 12)
                         .padding(.vertical, 8)
                         .background(Color(white: 0.2))
                         .cornerRadius(8)
