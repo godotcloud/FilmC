@@ -303,7 +303,7 @@ kernel void kernel_rt_halo_extract_horiz(
 
         float peakLin = max(max(baseLin.r, baseLin.g), baseLin.b);
         float hlKnee = max(peakLin - 0.42f, 0.0f) * (1.0f / 0.58f);
-        float3 s = baseLin * (1.0f + 3.40f * pow(hlKnee, 1.85f)) * u.exposureScale;
+        float3 s = baseLin * (1.0f + 2.40f * pow(hlKnee, 2.00f)) * u.exposureScale;
 
         float peak = max(max(s.r, s.g), s.b);
         float hlGate = smoothstep(cutoffLin * 0.45f, cutoffLin * 1.45f + 0.15f, peak);
@@ -437,7 +437,7 @@ kernel void kernel_fused_realtime_darkroom(
     // Stage 1: Inverse-ISP Highlight Decompression & 9-Subband Exact Spectral Emulsion Integration
     float peakLin = max(max(baseLin.r, baseLin.g), baseLin.b);
     float hlKnee = max(peakLin - 0.42f, 0.0f) * (1.0f / 0.58f);
-    float hlBoost = 1.0f + 3.40f * pow(hlKnee, 1.85f);
+    float hlBoost = 1.0f + 2.40f * pow(hlKnee, 2.00f);
     float3 rgb = baseLin * hlBoost * u.exposureScale;
 
     float cosThetaSq = 1.0f / (1.0f + rSq * 0.25f);
@@ -475,7 +475,7 @@ kernel void kernel_fused_realtime_darkroom(
     float3 effGamma = u.negativeGammaRGB.rgb * u.pushPullGammaScale;
     float3 normCenter = evaluate_hd_normalized(logE, effGamma, u.negativeShoulderRGB.xyz, u.negativeToeRGB.xyz, isReversal);
 
-    float microContrastGain = 0.22f + 0.14f * u.chiaroscuroContrast;
+    float microContrastGain = 0.28f + 0.14f * u.chiaroscuroContrast;
     float3 normCoupled = float3(
         dot(u.dirCouplerMatrixRow0.xyz, normCenter),
         dot(u.dirCouplerMatrixRow1.xyz, normCenter),
@@ -524,8 +524,8 @@ kernel void kernel_fused_realtime_darkroom(
     netNegD *= u.callierQFactor;
 
     float normNegLuma = clamp(dot(netNegD * 0.5f, float3(0.30f, 0.55f, 0.15f)), 0.0f, 1.0f);
-    float shWeight = pow(clamp(1.0f - normNegLuma * 1.45f, 0.0f, 1.0f), 1.25f);
-    float hlWeight = smoothstep(0.34f, 0.86f, normNegLuma) * clamp((0.96f - normNegLuma) / 0.18f, 0.25f, 1.0f);
+    float shWeight = smoothstep(0.05f, 0.18f, normNegLuma) * pow(clamp(1.0f - normNegLuma * 1.45f, 0.0f, 1.0f), 1.25f);
+    float hlWeight = smoothstep(0.32f, 0.66f, normNegLuma) * (1.0f - smoothstep(0.76f, 0.97f, normNegLuma));
 
     float shGM   = u.cinemaSplitTone.x;
     float shTR   = u.cinemaSplitTone.y;
@@ -724,7 +724,7 @@ kernel void kernel_spectral_upsample_and_expose(
 
     float peakLin = max(max(baseLin.r, baseLin.g), baseLin.b);
     float hlKnee = max(peakLin - 0.42f, 0.0f) * (1.0f / 0.58f);
-    float hlBoost = 1.0f + 3.40f * pow(hlKnee, 1.85f);
+    float hlBoost = 1.0f + 2.40f * pow(hlKnee, 2.00f);
     float3 rgb = baseLin * hlBoost * u.exposureScale;
 
     float cosThetaSq = 1.0f / (1.0f + rSq * 0.25f);
@@ -947,8 +947,8 @@ kernel void kernel_enlarger_print_and_grain(
     float3 netPrintOrScanDensity = float3(0.0f);
 
     float normNegLuma = clamp(dot(netNegD * 0.5f, float3(0.30f, 0.55f, 0.15f)), 0.0f, 1.0f);
-    float shWeight = pow(clamp(1.0f - normNegLuma * 1.45f, 0.0f, 1.0f), 1.25f);
-    float hlWeight = smoothstep(0.34f, 0.86f, normNegLuma) * clamp((0.96f - normNegLuma) / 0.18f, 0.25f, 1.0f);
+    float shWeight = smoothstep(0.05f, 0.18f, normNegLuma) * pow(clamp(1.0f - normNegLuma * 1.45f, 0.0f, 1.0f), 1.25f);
+    float hlWeight = smoothstep(0.32f, 0.66f, normNegLuma) * (1.0f - smoothstep(0.76f, 0.97f, normNegLuma));
 
     float shGM   = u.cinemaSplitTone.x;
     float shTR   = u.cinemaSplitTone.y;

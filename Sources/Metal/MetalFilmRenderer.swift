@@ -434,11 +434,11 @@ public final class MetalFilmRenderer {
         let modelMultiplier: Float
         switch params.diffusionModel {
         case .none:            modelMultiplier = 0.0
-        case .blackProMist1_8: modelMultiplier = 0.85
-        case .blackProMist1_4: modelMultiplier = 1.35
-        case .blackProMist1_2: modelMultiplier = 2.10
-        case .glimmerglass1_4: modelMultiplier = 1.50
-        case .vintageSoftLens: modelMultiplier = 2.60
+        case .blackProMist1_8: modelMultiplier = 0.55
+        case .blackProMist1_4: modelMultiplier = 0.85
+        case .blackProMist1_2: modelMultiplier = 1.25
+        case .glimmerglass1_4: modelMultiplier = 0.95
+        case .vintageSoftLens: modelMultiplier = 1.15
         }
         let effBloomStrength: Float = params.bloomStrength * modelMultiplier
 

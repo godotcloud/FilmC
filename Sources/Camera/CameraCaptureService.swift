@@ -100,7 +100,7 @@ public enum VideoResolutionPreset: String, CaseIterable, Identifiable, Equatable
         switch self {
         case .hd720p:  return 22_000_000
         case .fhd1080: return 50_000_000
-        case .uhd4k:   return 72_000_000
+        case .uhd4k:   return 85_000_000
         }
     }
 }
@@ -338,8 +338,8 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             session.addOutput(photoOutput)
         }
         photoOutput.isHighResolutionCaptureEnabled = true
-        if photoOutput.maxPhotoQualityPrioritization.rawValue >= AVCapturePhotoOutput.QualityPrioritization.balanced.rawValue {
-            photoOutput.maxPhotoQualityPrioritization = .balanced
+        if photoOutput.maxPhotoQualityPrioritization.rawValue >= AVCapturePhotoOutput.QualityPrioritization.quality.rawValue {
+            photoOutput.maxPhotoQualityPrioritization = .quality
         }
 
         do {
@@ -709,7 +709,7 @@ public final class CameraCaptureService: NSObject, ObservableObject {
             if self.photoOutput.isHighResolutionCaptureEnabled {
                 photoSettings.isHighResolutionPhotoEnabled = true
             }
-            photoSettings.photoQualityPrioritization = .speed
+            photoSettings.photoQualityPrioritization = .balanced
 
             if let photoConn = self.photoOutput.connection(with: .video),
                photoConn.isVideoOrientationSupported {
@@ -858,10 +858,15 @@ public final class CameraCaptureService: NSObject, ObservableObject {
                     AVVideoHeightKey: recHeight
                 ]
                 if codecSnapshot != .proRes422 {
-                    videoSettings[AVVideoCompressionPropertiesKey] = [
+                    var compProps: [String: Any] = [
                         AVVideoAverageBitRateKey: resSnapshot.targetBitRate,
-                        AVVideoExpectedSourceFrameRateKey: fpsSnapshot.rawValue
+                        AVVideoExpectedSourceFrameRateKey: fpsSnapshot.rawValue,
+                        AVVideoMaxKeyFrameIntervalKey: fpsSnapshot.rawValue
                     ]
+                    if codecSnapshot == .h264 {
+                        compProps[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
+                    }
+                    videoSettings[AVVideoCompressionPropertiesKey] = compProps
                 }
 
                 let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
