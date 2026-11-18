@@ -411,7 +411,7 @@ public final class MetalFilmRenderer {
         let fogOffset: Float = max(0.0, params.pushPullStops * 0.025 + tempDelta * 0.08)
 
         let m = negStock.dirInterlayerMatrix
-        let cpl = params.dirCouplerAmount
+        let cpl = 1.0 + (params.dirCouplerAmount - 1.0) * 0.55
         let r0Raw = SIMD3<Float>(1.0 + (m[0] - 1.0) * cpl, m[1] * cpl, m[2] * cpl)
         let r1Raw = SIMD3<Float>(m[3] * cpl, 1.0 + (m[4] - 1.0) * cpl, m[5] * cpl)
         let r2Raw = SIMD3<Float>(m[6] * cpl, m[7] * cpl, 1.0 + (m[8] - 1.0) * cpl)

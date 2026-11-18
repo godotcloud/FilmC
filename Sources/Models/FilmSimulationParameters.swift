@@ -123,7 +123,7 @@ public struct FilmSimulationParameters: Codable, Equatable {
     // Stage 2: Optical Diffusion & Bloom
     public var diffusionModel: OpticalDiffusionModel = .blackProMist1_8
     public var bloomStrength: Float = 0.14
-    public var bloomHighlightThreshold: Float = 0.68
+    public var bloomHighlightThreshold: Float = 0.72
     public var bloomRadiusMicrometers: Float = 150.0
 
     // Stage 2b: Emulsion Scatter & Remjet/Base Halation
@@ -246,7 +246,7 @@ public enum HKCinemaRecipeDatabase {
                 p.printGammaContrast = 1.06
                 p.diffusionModel = .vintageSoftLens
                 p.bloomStrength = 0.16
-                p.bloomHighlightThreshold = 0.58
+                p.bloomHighlightThreshold = 0.68
                 p.halationEnabled = true
                 p.halationStrengthRGB = SIMD3<Float>(0.12, 0.028, 0.003)
                 p.opticalVignettingStrength = 0.42
@@ -277,7 +277,7 @@ public enum HKCinemaRecipeDatabase {
                 p.printGammaContrast = 1.06
                 p.diffusionModel = .vintageSoftLens
                 p.bloomStrength = 0.22
-                p.bloomHighlightThreshold = 0.58
+                p.bloomHighlightThreshold = 0.68
                 p.halationEnabled = true
                 p.halationStrengthRGB = SIMD3<Float>(0.10, 0.025, 0.003)
                 p.opticalVignettingStrength = 0.40
@@ -309,7 +309,7 @@ public enum HKCinemaRecipeDatabase {
                 p.stepPrintTrail = 0.0
                 p.diffusionModel = .blackProMist1_4
                 p.bloomStrength = 0.16
-                p.bloomHighlightThreshold = 0.55
+                p.bloomHighlightThreshold = 0.66
                 p.halationEnabled = true
                 p.halationStrengthRGB = SIMD3<Float>(0.11, 0.030, 0.004)
                 p.opticalVignettingStrength = 0.36

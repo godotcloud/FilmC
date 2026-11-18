@@ -135,14 +135,17 @@ inline float3 evaluate_hd_normalized(
         float3 asym;
         for (int i = 0; i < 3; ++i) {
             if (x[i] >= 0.0f) {
-                asym[i] = rsqrt(1.0f + 0.22f * shoulderSoftness[i] * abs(x[i]));
+                asym[i] = rsqrt(1.0f + 0.24f * shoulderSoftness[i] * abs(x[i]));
             } else {
-                asym[i] = rsqrt(1.0f + 0.16f * toeSoftness[i] * abs(x[i]));
+                asym[i] = rsqrt(1.0f + 0.19f * toeSoftness[i] * abs(x[i]));
             }
         }
-        float3 k = 3.05f * gamma * asym;
+        float3 k = 2.75f * gamma * asym;
         float3 expTerm = exp(-clamp(k * x, -16.0f, 16.0f));
-        return 1.0f / (1.0f + expTerm);
+        float3 normCh = 1.0f / (1.0f + expTerm);
+        // 16% Interlayer Luminance Coupling prevents saturated primary colors (e.g. royal blue jerseys) from channel-splitting into neon posterization
+        float normLuma = dot(normCh, float3(0.2126f, 0.7152f, 0.0722f));
+        return mix(normCh, float3(normLuma), 0.16f);
     }
 }
 
@@ -282,8 +285,9 @@ kernel void kernel_rt_halo_extract_horiz(
     }
 
     float invW = 1.0f / float(max(width, 1u));
-    // Map `bloomThreshold` (0.15..1.20) directly to scene-linear cutoff so lowering the slider visibly blooms mid-highlights!
-    float cutoffLin = pow(clamp(u.bloomThreshold, 0.12f, 1.25f), 1.85f) * 0.42f;
+    // Map `bloomThreshold` (0.15..1.20) to true specular linear threshold (`0.35..1.45`, default 0.72 -> 0.92 linear / sRGB 0.88)
+    // so only real light sources bloom and ceiling trusses/pillars/jerseys stay 100% crisp and fog-free!
+    float cutoffLin = mix(0.35f, 1.45f, clamp(u.bloomThreshold, 0.15f, 1.20f) / 1.20f);
     // Scale pyramid blur radius dynamically with `u.bloomRadiusPx` & `u.halationRadiusPxRGB.x` (capped at 1.85px/tap for zero gaps!)
     float activeRadPx = needBloom ? max(u.bloomRadiusPx, u.halationRadiusPxRGB.x * 0.5f) : u.halationRadiusPxRGB.x;
     float pyrRadPx = clamp(activeRadPx * 0.18f, 1.6f, 14.8f);
@@ -302,12 +306,12 @@ kernel void kernel_rt_halo_extract_horiz(
         float3 baseLin = ycbcr_to_scene_linear(yVal, cbcrVal, is10BitInput);
 
         float peakLin = max(max(baseLin.r, baseLin.g), baseLin.b);
-        float hlKnee = max(peakLin - 0.42f, 0.0f) * (1.0f / 0.58f);
-        float3 s = baseLin * (1.0f + 2.40f * pow(hlKnee, 2.00f)) * u.exposureScale;
+        float hlKnee = max(peakLin - 0.54f, 0.0f) * (1.0f / 0.46f);
+        float3 s = baseLin * (1.0f + 1.85f * pow(hlKnee, 1.85f)) * u.exposureScale;
 
         float peak = max(max(s.r, s.g), s.b);
-        float hlGate = smoothstep(cutoffLin * 0.45f, cutoffLin * 1.45f + 0.15f, peak);
-        float3 brightExcess = max(s - float3(cutoffLin * 0.40f), float3(0.0f)) * hlGate;
+        float hlGate = smoothstep(cutoffLin * 0.85f, cutoffLin * 1.55f + 0.25f, peak);
+        float3 brightExcess = max(s - float3(cutoffLin * 0.78f), float3(0.0f)) * hlGate;
 
         accum += brightExcess * w;
         wSum += w;
@@ -436,8 +440,8 @@ kernel void kernel_fused_realtime_darkroom(
 
     // Stage 1: Inverse-ISP Highlight Decompression & 9-Subband Exact Spectral Emulsion Integration
     float peakLin = max(max(baseLin.r, baseLin.g), baseLin.b);
-    float hlKnee = max(peakLin - 0.42f, 0.0f) * (1.0f / 0.58f);
-    float hlBoost = 1.0f + 2.40f * pow(hlKnee, 2.00f);
+    float hlKnee = max(peakLin - 0.54f, 0.0f) * (1.0f / 0.46f);
+    float hlBoost = 1.0f + 1.85f * pow(hlKnee, 1.85f);
     float3 rgb = baseLin * hlBoost * u.exposureScale;
 
     float cosThetaSq = 1.0f / (1.0f + rSq * 0.25f);
@@ -484,7 +488,7 @@ kernel void kernel_fused_realtime_darkroom(
 
     if (!isReversal && u.chiaroscuroContrast > 0.001f) {
         float lumaN = dot(normCoupled, float3(0.30f, 0.55f, 0.15f));
-        float shadowPull = u.chiaroscuroContrast * 0.22f * max(0.52f - lumaN, 0.0f) * clamp(lumaN / 0.52f, 0.0f, 1.0f);
+        float shadowPull = u.chiaroscuroContrast * 0.13f * smoothstep(0.04f, 0.26f, lumaN) * (1.0f - smoothstep(0.26f, 0.52f, lumaN));
         normCoupled = clamp(normCoupled - float3(shadowPull), 0.0f, 1.0f);
     }
 
@@ -556,16 +560,16 @@ kernel void kernel_fused_realtime_darkroom(
 
         float3 spanP = max(u.printDmaxRGB.rgb - u.printDminRGB.rgb, float3(1.9f));
         float meanPrtG = (u.printGammaRGB.r + u.printGammaRGB.g + u.printGammaRGB.b) * 0.333333f;
-        float baseSlope = 3.25f * pow(clamp(meanPrtG / 2.42f, 0.75f, 1.45f), 0.55f) * u.printGamma;
-        float3 pSlope = float3(baseSlope * 1.03f, baseSlope * 1.00f, baseSlope * 0.96f);
+        float baseSlope = 2.92f * pow(clamp(meanPrtG / 2.42f, 0.75f, 1.45f), 0.50f) * u.printGamma;
+        float3 pSlope = float3(baseSlope * 1.02f, baseSlope * 1.00f, baseSlope * 0.97f);
         if (u.isReversalOrMono == 2) {
             float vcMultiplier = 0.58f + 0.20f * u.bwMultigradeGrade;
             pSlope = float3(baseSlope * vcMultiplier);
         }
 
-        float3 xP = logPrintE + 0.7447f - 0.17f;
-        const float3 paperToeSoft  = float3(0.14f, 0.17f, 0.22f);
-        const float3 paperShldSoft = float3(0.14f, 0.15f, 0.17f);
+        float3 xP = logPrintE + 0.7447f - 0.115f;
+        const float3 paperToeSoft  = float3(0.17f, 0.20f, 0.25f);
+        const float3 paperShldSoft = float3(0.17f, 0.18f, 0.20f);
         float3 paperAsym;
         for (int i = 0; i < 3; ++i) {
             paperAsym[i] = (xP[i] < 0.0f)
@@ -573,7 +577,7 @@ kernel void kernel_fused_realtime_darkroom(
                 : rsqrt(1.0f + paperShldSoft[i] * abs(xP[i]));
         }
         float3 rawPrtD = spanP / (1.0f + exp(-clamp(pSlope * paperAsym * xP, -16.0f, 16.0f)));
-        netPrintOrScanDensity = max(rawPrtD - float3(0.042f), float3(0.0f)) * 1.04f;
+        netPrintOrScanDensity = max(rawPrtD - float3(0.105f), float3(0.0f)) * 1.07f;
     } else {
         float3 normNeg = clamp(netNegD * 0.5f, 0.0f, 1.0f);
         float3 stretched = clamp((normNeg - 0.10f) / 0.80f, 0.0f, 1.0f);
@@ -627,8 +631,18 @@ kernel void kernel_fused_realtime_darkroom(
     // (In addition to pre-emulsion highlight expansion, optical diffusion filters scatter highlight photons
     // across neighbouring shadows/midtones on the image plane, producing a visible pearlescent mist glow!)
     if (needBloom) {
-        float3 mistVeil = smoothBrightGlow * (u.bloomStrength * 0.12f);
-        linearOut = linearOut + mistVeil * clamp(1.15f - linearOut, float3(0.15f), float3(1.0f));
+        float3 mistVeil = smoothBrightGlow * (u.bloomStrength * 0.065f);
+        linearOut = linearOut + mistVeil * clamp(1.05f - linearOut, float3(0.10f), float3(0.85f));
+    }
+
+    // Helmholtz-Kohlrausch Subtractive CMY Print Dye Density Deepening:
+    // Real silver-halide chromogenic print dyes absorb overlapping spectral bands as saturation increases,
+    // giving deep royal blues, crimsons, and emeralds a velvety physical density instead of neon digital glare.
+    if (u.isReversalOrMono != 2) {
+        float maxC = max(max(linearOut.r, linearOut.g), linearOut.b);
+        float minC = min(min(linearOut.r, linearOut.g), linearOut.b);
+        float sat = (maxC - minC) / max(maxC, 1e-4f);
+        linearOut *= (1.0f - 0.085f * sat * (1.0f - clamp(maxC, 0.0f, 1.0f) * 0.50f));
     }
 
     if (u.isReversalOrMono == 2) {
@@ -723,8 +737,8 @@ kernel void kernel_spectral_upsample_and_expose(
     }
 
     float peakLin = max(max(baseLin.r, baseLin.g), baseLin.b);
-    float hlKnee = max(peakLin - 0.42f, 0.0f) * (1.0f / 0.58f);
-    float hlBoost = 1.0f + 2.40f * pow(hlKnee, 2.00f);
+    float hlKnee = max(peakLin - 0.54f, 0.0f) * (1.0f / 0.46f);
+    float hlBoost = 1.0f + 1.85f * pow(hlKnee, 1.85f);
     float3 rgb = baseLin * hlBoost * u.exposureScale;
 
     float cosThetaSq = 1.0f / (1.0f + rSq * 0.25f);
@@ -767,7 +781,7 @@ kernel void kernel_halation_bloom_horizontal(
     float2 uvCenter = (float2(gid) + 0.5f) / float2(float(width), float(height));
     float invW = 1.0f / float(max(width, 1u));
 
-    float cutoffLin = pow(clamp(u.bloomThreshold, 0.12f, 1.25f), 1.85f) * 0.42f;
+    float cutoffLin = mix(0.35f, 1.45f, clamp(u.bloomThreshold, 0.15f, 1.20f) / 1.20f);
     float activeRadPx = needBloom ? max(u.bloomRadiusPx, u.halationRadiusPxRGB.x * 0.5f) : u.halationRadiusPxRGB.x;
     float effRadiusPx = clamp(activeRadPx * 0.55f, 2.0f, 15.0f);
     float stepUV = (effRadiusPx / 8.0f) * invW;
@@ -782,8 +796,8 @@ kernel void kernel_halation_bloom_horizontal(
         float3 s = inExposure.sample(linSampler, sampleUV).rgb;
 
         float peak = max(max(s.r, s.g), s.b);
-        float hlGate = smoothstep(cutoffLin * 0.45f, cutoffLin * 1.45f + 0.15f, peak);
-        float3 brightExcess = max(s - float3(cutoffLin * 0.40f), float3(0.0f)) * hlGate;
+        float hlGate = smoothstep(cutoffLin * 0.85f, cutoffLin * 1.55f + 0.25f, peak);
+        float3 brightExcess = max(s - float3(cutoffLin * 0.78f), float3(0.0f)) * hlGate;
 
         accum += brightExcess * w;
         wSum += w;
@@ -834,7 +848,7 @@ kernel void kernel_halation_and_scatter(
     float3 smoothBrightGlow = blurAccum / wSum;
     float3 haloExcess = max(smoothBrightGlow - centerExp * 0.45f, float3(0.0f));
     float3 halationSignal = needHalation ? (haloExcess * u.halationStrengthRGB.rgb * 1.65f) : float3(0.0f);
-    float3 bloomSignal = needBloom ? (smoothBrightGlow * u.bloomStrength * 1.15f) : float3(0.0f);
+    float3 bloomSignal = needBloom ? (smoothBrightGlow * u.bloomStrength * 0.52f) : float3(0.0f);
 
     float3 finalExposure = max(centerExp + halationSignal + bloomSignal, float3(1e-7f));
     outScatteredExposure.write(float4(finalExposure, 1.0f), gid);
@@ -882,7 +896,7 @@ kernel void kernel_develop_and_dir_couplers(
 
     if (!isReversal && u.chiaroscuroContrast > 0.001f) {
         float lumaN = dot(normCoupled, float3(0.30f, 0.55f, 0.15f));
-        float shadowPull = u.chiaroscuroContrast * 0.22f * max(0.52f - lumaN, 0.0f) * clamp(lumaN / 0.52f, 0.0f, 1.0f);
+        float shadowPull = u.chiaroscuroContrast * 0.13f * smoothstep(0.04f, 0.26f, lumaN) * (1.0f - smoothstep(0.26f, 0.52f, lumaN));
         normCoupled = clamp(normCoupled - float3(shadowPull), 0.0f, 1.0f);
     }
 
@@ -977,16 +991,16 @@ kernel void kernel_enlarger_print_and_grain(
 
         float3 spanP = max(u.printDmaxRGB.rgb - u.printDminRGB.rgb, float3(1.9f));
         float meanPrtG = (u.printGammaRGB.r + u.printGammaRGB.g + u.printGammaRGB.b) * 0.333333f;
-        float baseSlope = 3.25f * pow(clamp(meanPrtG / 2.42f, 0.75f, 1.45f), 0.55f) * u.printGamma;
-        float3 pSlope = float3(baseSlope * 1.03f, baseSlope * 1.00f, baseSlope * 0.96f);
+        float baseSlope = 2.92f * pow(clamp(meanPrtG / 2.42f, 0.75f, 1.45f), 0.50f) * u.printGamma;
+        float3 pSlope = float3(baseSlope * 1.02f, baseSlope * 1.00f, baseSlope * 0.97f);
         if (u.isReversalOrMono == 2) {
             float vcMultiplier = 0.58f + 0.20f * u.bwMultigradeGrade;
             pSlope = float3(baseSlope * vcMultiplier);
         }
 
-        float3 xP = logPrintE + 0.7447f - 0.17f;
-        const float3 paperToeSoft  = float3(0.14f, 0.17f, 0.22f);
-        const float3 paperShldSoft = float3(0.14f, 0.15f, 0.17f);
+        float3 xP = logPrintE + 0.7447f - 0.115f;
+        const float3 paperToeSoft  = float3(0.17f, 0.20f, 0.25f);
+        const float3 paperShldSoft = float3(0.17f, 0.18f, 0.20f);
         float3 paperAsym;
         for (int i = 0; i < 3; ++i) {
             paperAsym[i] = (xP[i] < 0.0f)
@@ -994,7 +1008,7 @@ kernel void kernel_enlarger_print_and_grain(
                 : rsqrt(1.0f + paperShldSoft[i] * abs(xP[i]));
         }
         float3 rawPrtD = spanP / (1.0f + exp(-clamp(pSlope * paperAsym * xP, -16.0f, 16.0f)));
-        netPrintOrScanDensity = max(rawPrtD - float3(0.042f), float3(0.0f)) * 1.04f;
+        netPrintOrScanDensity = max(rawPrtD - float3(0.105f), float3(0.0f)) * 1.07f;
     } else {
         float3 normNeg = clamp(netNegD * 0.5f, 0.0f, 1.0f);
         float3 stretched = clamp((normNeg - 0.10f) / 0.80f, 0.0f, 1.0f);
@@ -1042,6 +1056,13 @@ kernel void kernel_enlarger_print_and_grain(
 
     linearOut = (linearOut - float3(u.blackPoint)) / max(1.0f - u.blackPoint + u.whitePoint, 0.1f);
     linearOut = max(linearOut, float3(0.0f));
+
+    if (u.isReversalOrMono != 2) {
+        float maxC = max(max(linearOut.r, linearOut.g), linearOut.b);
+        float minC = min(min(linearOut.r, linearOut.g), linearOut.b);
+        float sat = (maxC - minC) / max(maxC, 1e-4f);
+        linearOut *= (1.0f - 0.085f * sat * (1.0f - clamp(maxC, 0.0f, 1.0f) * 0.50f));
+    }
 
     if (u.isReversalOrMono == 2) {
         float monoLuma = dot(linearOut, float3(0.2126f, 0.7152f, 0.0722f));
