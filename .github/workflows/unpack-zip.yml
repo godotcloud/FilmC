@@ -32,14 +32,12 @@ jobs:
           mkdir -p /tmp/spektracam_extract
           unzip -oq "$ZIP_FILE" -d /tmp/spektracam_extract
 
-          # Locate extracted SpektraCam root
           if [ -d "/tmp/spektracam_extract/SpektraCam" ]; then
             SRC_ROOT="/tmp/spektracam_extract/SpektraCam"
           else
             SRC_ROOT="/tmp/spektracam_extract"
           fi
 
-          # Prefer repo root if project.yml or Sources/ already lives at root
           if [ -f "project.yml" ] || [ -d "Sources" ]; then
             TARGET_DIR="."
           else
@@ -52,14 +50,9 @@ jobs:
           cp -Rf "$SRC_ROOT/Sources/"* "$TARGET_DIR/Sources/"
           cp -f "$SRC_ROOT/project.yml" "$TARGET_DIR/project.yml"
 
-          # NOTE: Never copy or modify .github/workflows/* here because GITHUB_TOKEN
-          # lacks `workflows` permission and GitHub rejects the entire `git push`!
-
-          # Remove legacy duplicate model files if present
           rm -f "$TARGET_DIR/Sources/Models/FilmStockParameters.swift"
           rm -f "$TARGET_DIR/Sources/Models/FilmStockDatabase.swift.bak"
 
-          # Clean up all uploaded zip archives so repo stays clean
           find . -maxdepth 2 -name "*.zip" -type f -delete
           rm -rf /tmp/spektracam_extract
 
